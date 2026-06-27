@@ -15,6 +15,7 @@ type PushReply struct {
 	Routes    []netip.Prefix
 	DNS       []netip.Addr
 	PeerID    uint32
+	Cipher    string
 	Redirect  bool
 	BlockIPv6 bool
 }
@@ -79,6 +80,10 @@ func ParsePushReply(message string) (*PushReply, error) {
 					return nil, fmt.Errorf("parse pushed peer-id %q: %w", fields[1], err)
 				}
 				reply.PeerID = uint32(id)
+			}
+		case "cipher":
+			if len(fields) >= 2 {
+				reply.Cipher = fields[1]
 			}
 		case "redirect-gateway":
 			reply.Redirect = true

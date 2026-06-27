@@ -61,7 +61,12 @@ type ClientConfig struct {
 
 // DataCipherKeyLength returns the key size for the negotiated data cipher.
 func (c ClientConfig) DataCipherKeyLength() int {
-	switch c.Cipher {
+	return cipherKeyLength(c.Cipher)
+}
+
+// cipherKeyLength returns the data cipher key size in bytes for the given cipher.
+func cipherKeyLength(cipher string) int {
+	switch cipher {
 	case CipherAES256GCM, CipherAES256CBC, CipherChaCha20Poly1305:
 		return 32
 	case CipherAES192GCM, CipherAES192CBC:
@@ -69,6 +74,19 @@ func (c ClientConfig) DataCipherKeyLength() int {
 	default:
 		return 16
 	}
+}
+
+// negotiatedCipher extracts the data cipher the server selected from the
+// key-method-2 options string, e.g. "...,cipher AES-128-GCM,auth ...". It
+// returns "" when the options carry no cipher field.
+func negotiatedCipher(options string) string {
+	for _, part := range strings.Split(options, ",") {
+		part = strings.TrimSpace(part)
+		if rest, ok := strings.CutPrefix(part, "cipher "); ok {
+			return normalizeCipher(rest)
+		}
+	}
+	return ""
 }
 
 func (c ClientConfig) RemoteAddress() string {

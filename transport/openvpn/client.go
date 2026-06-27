@@ -122,13 +122,6 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 
-	sources := clientRecord.Sources
-	sources.Server = serverRecord.Sources.Server
-	keys, err := DeriveClientKeyMaterial(sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), c.config.DataCipherKeyLength())
-	if err != nil {
-		return nil, fmt.Errorf("derive data channel keys: %w", err)
-	}
-
 	if _, err := c.tlsConn.Write([]byte(PushRequest + "\x00")); err != nil {
 		return nil, fmt.Errorf("write push request: %w", err)
 	}
@@ -136,8 +129,27 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// NCP (OpenVPN 2.4+): use the data cipher the server actually negotiated.
+	// The PUSH_REPLY "cipher" field is authoritative; fall back to the
+	// key-method-2 options, then the locally configured cipher.
+	dataCipher := c.config.Cipher
+	if negotiated := negotiatedCipher(serverRecord.Options); negotiated != "" {
+		dataCipher = negotiated
+	}
+	if push.Cipher != "" {
+		dataCipher = normalizeCipher(push.Cipher)
+	}
+
+	sources := clientRecord.Sources
+	sources.Server = serverRecord.Sources.Server
+	keys, err := DeriveClientKeyMaterial(sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), cipherKeyLength(dataCipher))
+	if err != nil {
+		return nil, fmt.Errorf("derive data channel keys: %w", err)
+	}
+
 	c.push = push
-	c.data, err = NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID)
+	c.data, err = NewDataChannel(keys, dataCipher, c.config.Auth, push.PeerID)
 	if err != nil {
 		return nil, err
 	}
@@ -309,6 +321,9 @@ func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
 			msg := string(buf)
 			if idx := strings.IndexByte(msg, 0); idx >= 0 {
 				msg = msg[:idx]
+			}
+			if strings.HasPrefix(msg, "AUTH_FAILED") {
+				return nil, fmt.Errorf("openvpn authentication failed (server replied %q); check credentials and peer-info such as IV_HWADDR", msg)
 			}
 			if reply, err := ParsePushReply(msg); err == nil {
 				return reply, nil
