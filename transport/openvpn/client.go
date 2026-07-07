@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -28,6 +27,13 @@ type Client struct {
 	tlsConn *tls.Conn
 	data    *DataChannel
 	push    *PushReply
+
+	// optionsString is the OCC options string sent in the key method 2
+	// record; it is also echoed in OCC_REPLY when the server probes us.
+	optionsString string
+	// tlsReadBuf holds TLS plaintext read but not yet consumed, so control
+	// channel messages coalesced in one flight are not lost between phases.
+	tlsReadBuf []byte
 
 	cancel context.CancelFunc
 
@@ -95,8 +101,9 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, fmt.Errorf("openvpn tls handshake: %w", err)
 	}
 
+	c.optionsString = InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO)
 	clientRecord, err := NewClientKeyMethod2Record(
-		InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO),
+		c.optionsString,
 		InstallScriptPeerInfo(c.config.Cipher, c.config.CompLZO, c.config.PeerInfo),
 		strings.TrimSpace(c.config.Username),
 		c.config.Password,
@@ -141,14 +148,17 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 }
 
 func (c *Client) WriteIPPacket(ctx context.Context, packet []byte) error {
-	return c.writeDataPacket(ctx, packet, true)
+	return c.writeDataPacket(ctx, packet)
 }
 
+// WritePing sends the keepalive magic. Like every other data channel
+// payload (the reference implementation included), it must go through the
+// compression framing, otherwise servers running comp-lzo drop our pings.
 func (c *Client) WritePing(ctx context.Context) error {
-	return c.writeDataPacket(ctx, openVPNPingPacket, false)
+	return c.writeDataPacket(ctx, openVPNPingPacket)
 }
 
-func (c *Client) writeDataPacket(ctx context.Context, packet []byte, compress bool) error {
+func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
 	if c.data == nil {
 		return errors.New("openvpn data channel is not ready")
 	}
@@ -156,7 +166,7 @@ func (c *Client) writeDataPacket(ctx context.Context, packet []byte, compress bo
 		return err
 	}
 	defer c.writeSem.Release(1)
-	if compress && c.config.CompLZO == CompLzoYes {
+	if c.config.CompLZO == CompLzoYes {
 		compressed, err := lzo1xCompressSafe(packet)
 		if err != nil {
 			return err
@@ -175,6 +185,10 @@ func (c *Client) writeDataPacket(ctx context.Context, packet []byte, compress bo
 	return nil
 }
 
+// ErrRemoteExit is returned by ReadIPPacket when the server announces it is
+// going away (OCC_EXIT / explicit-exit-notify).
+var ErrRemoteExit = errors.New("openvpn peer sent exit notify")
+
 func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 	if c.data == nil {
 		return nil, errors.New("openvpn data channel is not ready")
@@ -189,14 +203,57 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 			continue
 		}
 		c.markReceive()
+		// Compression framing wraps every data channel payload, so it must
+		// be stripped before recognizing ping and OCC messages.
+		if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
+			plain, err = lzo1xDecompressSafe(plain)
+			if err != nil {
+				continue
+			}
+		}
 		if IsPingPacket(plain) {
 			continue
 		}
-		if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
-			return lzo1xDecompressSafe(plain)
+		if isOCCPacket(plain) {
+			if err := c.handleOCC(ctx, plain); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if len(plain) == 0 {
+			continue
 		}
 		return plain, nil
 	}
+}
+
+func (c *Client) handleOCC(ctx context.Context, packet []byte) error {
+	switch occOpcode(packet) {
+	case OCCExit:
+		return ErrRemoteExit
+	case OCCRequest:
+		writeCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		_ = c.writeDataPacket(writeCtx, buildOCCReply(c.optionsString))
+	}
+	return nil
+}
+
+// SendExitNotify implements --explicit-exit-notify: tell the server we are
+// going away so it can drop the session immediately instead of keeping it
+// alive until its keepalive timeout. Only meaningful over UDP.
+func (c *Client) SendExitNotify(ctx context.Context) error {
+	if c.data == nil || c.config.Proto != ProtoUDP {
+		return nil
+	}
+	packet := buildOCCPacket(OCCExit, nil)
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		if err := c.writeDataPacket(ctx, packet); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func (c *Client) SinceSend() time.Duration {
@@ -221,6 +278,9 @@ func (c *Client) markReceive() {
 var start = time.Now().Add(-time.Hour)
 
 func (c *Client) Close() error {
+	notifyCtx, notifyCancel := context.WithTimeout(context.Background(), time.Second)
+	_ = c.SendExitNotify(notifyCtx)
+	notifyCancel()
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -274,8 +334,16 @@ func (c *Client) readServerKeyMethod(ctx context.Context) (*KeyMethod2Record, er
 			return nil, fmt.Errorf("read key method 2 server record: %w", err)
 		}
 		buf = append(buf, tmp[:n]...)
-		record, err := ParseServerKeyMethod2Record(buf)
+		// A server that rejects our credentials may answer with a control
+		// message instead of its key method record.
+		if bytes.HasPrefix(buf, []byte("AUTH_FAILED")) {
+			return nil, newAuthFailedError(stringUpToNUL(buf))
+		}
+		record, consumed, err := parseServerKeyMethod2Record(buf)
 		if err == nil {
+			// Keep anything the server coalesced after its record (for
+			// example an early PUSH_REPLY) for the message reader.
+			c.tlsReadBuf = append(c.tlsReadBuf, buf[consumed:]...)
 			return record, nil
 		}
 		if !strings.Contains(err.Error(), "truncated") && !errors.Is(err, ioStringEOF) {
@@ -284,32 +352,115 @@ func (c *Client) readServerKeyMethod(ctx context.Context) (*KeyMethod2Record, er
 	}
 }
 
-func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
-	var buf []byte
+// takeControlMessage extracts the next complete NUL-terminated control
+// channel message from the buffered TLS plaintext.
+func (c *Client) takeControlMessage() (string, bool) {
+	for {
+		idx := bytes.IndexByte(c.tlsReadBuf, 0)
+		if idx < 0 {
+			return "", false
+		}
+		msg := string(c.tlsReadBuf[:idx])
+		c.tlsReadBuf = c.tlsReadBuf[idx+1:]
+		if msg != "" {
+			return msg, true
+		}
+	}
+}
+
+func (c *Client) readControlMessage(ctx context.Context) (string, error) {
 	tmp := make([]byte, 4096)
 	for {
+		if msg, ok := c.takeControlMessage(); ok {
+			return msg, nil
+		}
 		if deadline, ok := ctx.Deadline(); ok {
 			_ = c.tlsConn.SetReadDeadline(deadline)
 		}
 		n, err := c.tlsConn.Read(tmp)
-		if err != nil {
-			if errors.Is(err, io.EOF) && len(buf) > 0 {
-				break
-			}
-			return nil, fmt.Errorf("read push reply: %w", err)
+		if n > 0 {
+			c.tlsReadBuf = append(c.tlsReadBuf, tmp[:n]...)
+			continue
 		}
-		buf = append(buf, tmp[:n]...)
-		if bytes.Contains(buf, []byte("\x00")) || strings.Contains(string(buf), "PUSH_REPLY") {
-			msg := string(buf)
-			if idx := strings.IndexByte(msg, 0); idx >= 0 {
-				msg = msg[:idx]
-			}
-			if reply, err := ParsePushReply(msg); err == nil {
-				return reply, nil
-			}
+		if err != nil {
+			return "", err
 		}
 	}
-	return nil, ctx.Err()
+}
+
+func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
+	// The server may legitimately delay PUSH_REPLY (deferred auth, load), so
+	// repeat PUSH_REQUEST at the reference implementation's interval until a
+	// reply or a fatal message arrives.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(PushRequestInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, _ = c.tlsConn.Write([]byte(PushRequest + "\x00"))
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	var messages []string
+	for {
+		msg, err := c.readControlMessage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("read push reply: %w", err)
+		}
+		switch {
+		case strings.HasPrefix(msg, "PUSH_REPLY"):
+			messages = append(messages, msg)
+			if pushReplyContinuation(msg) == pushContinuationPartial {
+				continue
+			}
+			return ParsePushReplyMessages(messages)
+		case strings.HasPrefix(msg, "AUTH_FAILED"):
+			return nil, newAuthFailedError(msg)
+		case strings.HasPrefix(msg, "HALT"):
+			return nil, fmt.Errorf("openvpn server sent halt: %q", msg)
+		case strings.HasPrefix(msg, "RESTART"):
+			return nil, fmt.Errorf("openvpn server requested restart: %q", msg)
+		default:
+			// AUTH_PENDING, INFO and other messages: keep waiting within
+			// the handshake deadline.
+		}
+	}
+}
+
+// AuthFailedError is returned when the server replies AUTH_FAILED,
+// distinguishing bad credentials from network timeouts.
+type AuthFailedError struct {
+	Reason string
+}
+
+func (e *AuthFailedError) Error() string {
+	if e.Reason == "" {
+		return "openvpn authentication failed"
+	}
+	return "openvpn authentication failed: " + e.Reason
+}
+
+func newAuthFailedError(message string) error {
+	reason := ""
+	if idx := strings.IndexByte(message, ','); idx >= 0 {
+		reason = strings.TrimSpace(message[idx+1:])
+	}
+	return &AuthFailedError{Reason: reason}
+}
+
+func stringUpToNUL(buf []byte) string {
+	if idx := bytes.IndexByte(buf, 0); idx >= 0 {
+		return string(buf[:idx])
+	}
+	return string(buf)
 }
 
 func (c *Client) tlsConfig() (*tls.Config, error) {

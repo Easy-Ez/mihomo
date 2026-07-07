@@ -112,6 +112,27 @@ func TestDataChannelAcceptsOutOfOrderPacketsWithinReplayWindow(t *testing.T) {
 	}
 }
 
+func TestDataChannelPacketIDExhaustion(t *testing.T) {
+	keys := &KeyMaterial{
+		SendCipherKey: bytes.Repeat([]byte{0x11}, 16),
+		SendHMACKey:   bytes.Repeat([]byte{0x22}, maxHMACKeyLength),
+		RecvCipherKey: bytes.Repeat([]byte{0x33}, 16),
+		RecvHMACKey:   bytes.Repeat([]byte{0x44}, maxHMACKeyLength),
+	}
+	channel, err := NewDataChannel(keys, CipherAES128GCM, AuthSHA256, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel.sendPacketID = ^uint32(0) - 1
+	if _, err := channel.Encrypt([]byte{0x45}); err != nil {
+		t.Fatalf("second-to-last packet id must still work: %v", err)
+	}
+	// The final packet id would wrap the counter and reuse an AEAD nonce.
+	if _, err := channel.Encrypt([]byte{0x45}); err == nil {
+		t.Fatal("expected packet id exhaustion error")
+	}
+}
+
 func TestParsePushReply(t *testing.T) {
 	reply, err := ParsePushReply("PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 8.8.8.8,ifconfig 10.8.0.2 255.255.255.0,peer-id 3,block-ipv6\x00")
 	if err != nil {
