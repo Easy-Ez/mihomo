@@ -207,7 +207,106 @@ func TestControlChannelReordersReliableMessages(t *testing.T) {
 	}
 }
 
-func TestClientWaitServerResetRetransmitsUDP(t *testing.T) {
+func TestControlChannelRetransmitsUntilAcked(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	var serverID SessionID
+	copy(serverID[:], []byte("server01"))
+
+	control := NewControlChannel(clientIO, nil, clientID)
+	now := time.Unix(1714567890, 0)
+	control.clock = func() time.Time { return now }
+
+	ctx := context.Background()
+	if err := control.SendReset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := serverIO.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _, _, err := DecodeControlPacket(nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Opcode != PControlHardResetClientV2 || packet.MessageID != 0 {
+		t.Fatalf("unexpected initial packet: %s/%d", packet.Opcode, packet.MessageID)
+	}
+
+	expectNoPacket := func() {
+		t.Helper()
+		shortCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		if _, err := serverIO.ReadPacket(shortCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("unexpected retransmission, err=%v", err)
+		}
+	}
+
+	// 1s after sending: the 2s timer has not expired yet.
+	now = now.Add(time.Second)
+	wait, err := control.RetransmitDue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wait != time.Second {
+		t.Fatalf("expected 1s until next due, got %s", wait)
+	}
+	expectNoPacket()
+
+	// 2.5s after sending: due, same message id, backoff doubles to 4s.
+	now = now.Add(1500 * time.Millisecond)
+	if _, err := control.RetransmitDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = serverIO.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _, _, err = DecodeControlPacket(nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Opcode != PControlHardResetClientV2 || packet.MessageID != 0 {
+		t.Fatalf("unexpected retransmitted packet: %s/%d", packet.Opcode, packet.MessageID)
+	}
+
+	// 3s later: still inside the doubled 4s backoff window.
+	now = now.Add(3 * time.Second)
+	if _, err := control.RetransmitDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectNoPacket()
+
+	// The peer ACKs message 0: the packet leaves the pending set for good.
+	ack, err := (ControlPacket{
+		Opcode:           PAckV1,
+		LocalSession:     serverID,
+		AckIDs:           []uint32{0},
+		AckRemoteSession: clientID,
+	}).Encode(nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverIO.WritePacket(ctx, ack); err != nil {
+		t.Fatal(err)
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := control.Read(readCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline after consuming pure ack, got %v", err)
+	}
+	if control.PendingMessages() != 0 {
+		t.Fatalf("expected empty pending set, got %d", control.PendingMessages())
+	}
+	now = now.Add(time.Hour)
+	if _, err := control.RetransmitDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectNoPacket()
+}
+
+func TestClientWaitServerResetAcksServerReset(t *testing.T) {
 	clientIO, serverIO := newMemoryPacketPair()
 	var clientID SessionID
 	copy(clientID[:], []byte("client01"))
@@ -238,20 +337,6 @@ func TestClientWaitServerResetRetransmitsUDP(t *testing.T) {
 			errCh <- errors.New("unexpected reset opcode")
 			return
 		}
-		raw, err := serverIO.ReadPacket(ctx)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		packet, _, _, err = DecodeControlPacket(nil, raw)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		if packet.Opcode != PControlHardResetClientV2 || packet.MessageID != 0 {
-			errCh <- errors.New("unexpected retransmitted reset packet")
-			return
-		}
 		_, err = serverControl.Send(ctx, PControlHardResetServerV2, nil)
 		errCh <- err
 	}()
@@ -264,6 +349,16 @@ func TestClientWaitServerResetRetransmitsUDP(t *testing.T) {
 	}
 	if clientControl.PendingMessages() != 0 {
 		t.Fatalf("expected client reset to be acked, pending=%d", clientControl.PendingMessages())
+	}
+	// The client must have ACKed the server reset so the server side is
+	// not left retransmitting it.
+	readCtx, readCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer readCancel()
+	if _, err := serverControl.Read(readCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline after consuming pure ack, got %v", err)
+	}
+	if serverControl.PendingMessages() != 0 {
+		t.Fatalf("expected server reset to be acked, pending=%d", serverControl.PendingMessages())
 	}
 }
 

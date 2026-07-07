@@ -15,10 +15,6 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-const (
-	ControlRetransmitDelay = time.Second
-)
-
 type Client struct {
 	config *ClientConfig
 	mux    *PacketMux
@@ -72,6 +68,7 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 		cancel:   cancel,
 		writeSem: semaphore.NewWeighted(1),
 	}
+	go client.control.RunRetransmitter(runCtx)
 	client.markSend()
 	client.markReceive()
 	return client, nil
@@ -142,6 +139,11 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The server answered PUSH_REPLY, so it received everything we sent.
+	// Drop any packet still awaiting an ACK: nothing reads the control
+	// channel after this point (yet), and endless retransmissions would
+	// make the server's ACK replies pile up in the control queue.
+	c.control.ClearPending()
 	c.markSend()
 	c.markReceive()
 	return push, nil
@@ -294,24 +296,12 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) waitServerReset(ctx context.Context) error {
-	retransmits := 0
+	// Retransmission of our hard reset (and every later control packet) is
+	// handled by the channel's RunRetransmitter goroutine.
 	for {
-		readCtx := ctx
-		cancel := func() {}
-		if c.config.Proto == ProtoUDP {
-			readCtx, cancel = context.WithTimeout(ctx, ControlRetransmitDelay)
-		}
-		packet, err := c.control.Read(readCtx)
-		cancel()
+		packet, err := c.control.Read(ctx)
 		if err != nil {
-			if c.config.Proto == ProtoUDP && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-				if err := c.control.RetransmitPending(ctx); err != nil {
-					return fmt.Errorf("retransmit hard reset: %w", err)
-				}
-				retransmits++
-				continue
-			}
-			return fmt.Errorf("read hard reset response after %d retransmits: %w", retransmits, err)
+			return fmt.Errorf("read hard reset response: %w", err)
 		}
 		switch packet.Opcode {
 		case PControlHardResetServerV2:

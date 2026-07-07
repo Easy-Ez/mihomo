@@ -20,6 +20,21 @@ type PacketIO interface {
 	RemoteAddr() net.Addr
 }
 
+const (
+	// ControlRetransmitInterval mirrors --tls-timeout: an un-ACKed control
+	// packet is retransmitted after 2 seconds, doubling per attempt.
+	ControlRetransmitInterval    = 2 * time.Second
+	ControlRetransmitMaxInterval = 16 * time.Second
+)
+
+// pendingControl tracks an outgoing reliable packet awaiting an ACK,
+// with its retransmission schedule.
+type pendingControl struct {
+	packet   *ControlPacket
+	nextSend time.Time
+	interval time.Duration
+}
+
 type ControlChannel struct {
 	io     PacketIO
 	crypt  *TLSCrypt
@@ -33,7 +48,7 @@ type ControlChannel struct {
 	sendMessage   uint32
 	recvMessage   uint32
 	ackPending    []uint32
-	pending       map[uint32]*ControlPacket
+	pending       map[uint32]*pendingControl
 	recvPending   map[uint32]*ControlPacket
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -45,7 +60,7 @@ func NewControlChannel(io PacketIO, crypt *TLSCrypt, local SessionID) *ControlCh
 		crypt:       crypt,
 		clock:       time.Now,
 		local:       local,
-		pending:     make(map[uint32]*ControlPacket),
+		pending:     make(map[uint32]*pendingControl),
 		recvPending: make(map[uint32]*ControlPacket),
 	}
 }
@@ -89,7 +104,11 @@ func (c *ControlChannel) Send(ctx context.Context, opcode Opcode, payload []byte
 		Payload:          cloneBytes(payload),
 	}
 	c.ackPending = nil
-	c.pending[messageID] = packet
+	c.pending[messageID] = &pendingControl{
+		packet:   packet,
+		nextSend: c.clock().Add(ControlRetransmitInterval),
+		interval: ControlRetransmitInterval,
+	}
 	c.mu.Unlock()
 
 	if err := c.writeControlPacket(ctx, packet); err != nil {
@@ -181,24 +200,78 @@ func (c *ControlChannel) PendingMessages() int {
 	return len(c.pending)
 }
 
-func (c *ControlChannel) RetransmitPending(ctx context.Context) error {
+// ClearPending drops un-ACKed outgoing packets. Called when a handshake
+// phase completes and the peer demonstrably received everything (it
+// answered), so late ACK loss must not trigger pointless retransmissions.
+func (c *ControlChannel) ClearPending() {
 	c.mu.Lock()
-	packets := make([]*ControlPacket, 0, len(c.pending))
-	for _, packet := range c.pending {
-		cp := *packet
-		cp.AckIDs = append([]uint32(nil), c.ackPending...)
-		cp.AckRemoteSession = c.remote
-		packets = append(packets, &cp)
-	}
-	c.ackPending = nil
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.pending = make(map[uint32]*pendingControl)
+}
 
-	for _, packet := range packets {
-		if err := c.writeControlPacket(ctx, packet); err != nil {
-			return err
+// RetransmitDue resends every reliable packet whose retransmission timer
+// expired, doubling its backoff, and reports how long the caller may sleep
+// before the next packet becomes due.
+func (c *ControlChannel) RetransmitDue(ctx context.Context) (time.Duration, error) {
+	now := c.clock()
+	wait := ControlRetransmitInterval
+
+	c.mu.Lock()
+	var due []*ControlPacket
+	for _, entry := range c.pending {
+		if !entry.nextSend.After(now) {
+			entry.interval *= 2
+			if entry.interval > ControlRetransmitMaxInterval {
+				entry.interval = ControlRetransmitMaxInterval
+			}
+			entry.nextSend = now.Add(entry.interval)
+			// Retransmissions carry the current ACK backlog and always get
+			// a fresh tls-crypt packet id (assigned in writeControlPacket).
+			cp := *entry.packet
+			cp.AckIDs = append([]uint32(nil), c.ackPending...)
+			cp.AckRemoteSession = c.remote
+			c.ackPending = nil
+			due = append(due, &cp)
+		}
+		if until := entry.nextSend.Sub(now); until < wait {
+			wait = until
 		}
 	}
-	return nil
+	c.mu.Unlock()
+
+	for _, packet := range due {
+		if err := c.writeControlPacket(ctx, packet); err != nil {
+			return wait, err
+		}
+	}
+	return wait, nil
+}
+
+// RunRetransmitter drives the reliability layer until ctx is cancelled,
+// mirroring the reference implementation's --tls-timeout handling. Without
+// it a single lost UDP control packet stalls the whole handshake.
+func (c *ControlChannel) RunRetransmitter(ctx context.Context) {
+	timer := time.NewTimer(ControlRetransmitInterval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		wait, err := c.RetransmitDue(ctx)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Transient write failure: keep the packet pending and retry
+			// on the next tick.
+		}
+		if wait < 100*time.Millisecond {
+			wait = 100 * time.Millisecond
+		}
+		timer.Reset(wait)
+	}
 }
 
 func (c *ControlChannel) writeControlPacket(ctx context.Context, packet *ControlPacket) error {
