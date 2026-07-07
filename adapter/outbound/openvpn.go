@@ -412,7 +412,9 @@ func (o *OpenVPN) startPacketLoops(pingInterval, pingRestart time.Duration) {
 		for runCtx.Err() == nil {
 			packet, err := client.ReadIPPacket(runCtx)
 			if err != nil {
-				if errors.Is(err, ovpn.ErrRemoteExit) {
+				if sessionErr := client.SessionErr(); sessionErr != nil {
+					log.Warnln("[OpenVPN](%s) session terminated: %v; will re-establish on next dial", o.name, sessionErr)
+				} else if errors.Is(err, ovpn.ErrRemoteExit) {
 					log.Warnln("[OpenVPN](%s) server sent exit notify, session will be re-established on next dial", o.name)
 				} else if runCtx.Err() == nil && (errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed)) {
 					log.Warnln("[OpenVPN](%s) OpenVPN link closed while reading packet: %v", o.name, err)

@@ -482,6 +482,87 @@ func TestSendCapsPiggybackedAcks(t *testing.T) {
 	}
 }
 
+func TestControlChannelSurfacesSoftReset(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	var serverID SessionID
+	copy(serverID[:], []byte("server01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+
+	// Simulate a session whose reliable stream has already advanced; the
+	// soft reset's message id 0 belongs to a new key session and must not
+	// be treated as a stale duplicate of the current stream.
+	control.mu.Lock()
+	control.recvMessage = 7
+	control.mu.Unlock()
+
+	reset, err := (ControlPacket{
+		Opcode:       PControlSoftResetV1,
+		KeyID:        1,
+		LocalSession: serverID,
+		MessageID:    0,
+	}).Encode(nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := serverIO.WritePacket(ctx, reset); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := control.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Opcode != PControlSoftResetV1 || packet.KeyID != 1 {
+		t.Fatalf("unexpected packet: %s key=%d", packet.Opcode, packet.KeyID)
+	}
+	control.mu.Lock()
+	pendingAcks := len(control.ackPending)
+	control.mu.Unlock()
+	if pendingAcks != 0 {
+		t.Fatalf("soft reset polluted the current ack backlog: %d", pendingAcks)
+	}
+}
+
+func TestControlConnNotifyAbortsOnSoftReset(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	var serverID SessionID
+	copy(serverID[:], []byte("server01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+	conn := NewControlConn(control)
+
+	sentinel := errors.New("renegotiation requested")
+	conn.SetNotify(func(packet *ControlPacket) error {
+		if packet.Opcode == PControlSoftResetV1 {
+			return sentinel
+		}
+		return nil
+	})
+
+	reset, err := (ControlPacket{
+		Opcode:       PControlSoftResetV1,
+		KeyID:        1,
+		LocalSession: serverID,
+		MessageID:    0,
+	}).Encode(nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := serverIO.WritePacket(ctx, reset); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	if _, err := conn.Read(buf); !errors.Is(err, sentinel) {
+		t.Fatalf("expected notify error to abort read, got %v", err)
+	}
+}
+
 func TestTCPPacketIOFraming(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

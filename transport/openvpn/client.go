@@ -19,10 +19,17 @@ type Client struct {
 	config *ClientConfig
 	mux    *PacketMux
 
-	control *ControlChannel
-	tlsConn *tls.Conn
-	data    *DataChannel
-	push    *PushReply
+	control     *ControlChannel
+	controlConn *ControlConn
+	tlsConn     *tls.Conn
+	data        *DataChannel
+	push        *PushReply
+
+	// sessionErr records why the session died (AUTH_FAILED, HALT, soft
+	// reset, ...) so the adapter can log something actionable instead of
+	// a generic "connection closed".
+	sessionErr atomic.Pointer[error]
+	runCtx     context.Context
 
 	// optionsString is the OCC options string sent in the key method 2
 	// record; it is also echoed in OCC_REPLY when the server probes us.
@@ -66,6 +73,7 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 		mux:      mux,
 		control:  NewControlChannel(mux, crypt, local),
 		cancel:   cancel,
+		runCtx:   runCtx,
 		writeSem: semaphore.NewWeighted(1),
 	}
 	go client.control.RunRetransmitter(runCtx)
@@ -89,8 +97,8 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, err
 	}
-	controlConn := NewControlConn(c.control)
-	c.tlsConn = tls.Client(controlConn, tlsConfig)
+	c.controlConn = NewControlConn(c.control)
+	c.tlsConn = tls.Client(c.controlConn, tlsConfig)
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.tlsConn.SetDeadline(deadline)
 	}
@@ -140,13 +148,69 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 	// The server answered PUSH_REPLY, so it received everything we sent.
-	// Drop any packet still awaiting an ACK: nothing reads the control
-	// channel after this point (yet), and endless retransmissions would
-	// make the server's ACK replies pile up in the control queue.
+	// Drop any packet still awaiting an ACK before the keeper takes over.
 	c.control.ClearPending()
+	c.startControlKeeper()
 	c.markSend()
 	c.markReceive()
 	return push, nil
+}
+
+// ErrRenegotiationRequested is recorded when the server starts a key
+// renegotiation (P_CONTROL_SOFT_RESET_V1). Renegotiation is not implemented
+// yet, so the session is torn down cleanly and re-established on the next
+// dial instead of lingering until the server's hand-window kills it.
+var ErrRenegotiationRequested = errors.New("openvpn server requested key renegotiation")
+
+// startControlKeeper keeps consuming the control channel after the
+// handshake. Without it the packet mux control queue fills up and stalls
+// the data channel, and server messages (AUTH_FAILED on token expiry,
+// RESTART, HALT, soft resets) go unnoticed.
+func (c *Client) startControlKeeper() {
+	c.controlConn.SetNotify(func(packet *ControlPacket) error {
+		if packet.Opcode == PControlSoftResetV1 {
+			return ErrRenegotiationRequested
+		}
+		return nil
+	})
+	go func() {
+		for c.runCtx.Err() == nil {
+			msg, err := c.readControlMessage(c.runCtx)
+			if err != nil {
+				if c.runCtx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+					c.failSession(err)
+				}
+				return
+			}
+			switch {
+			case strings.HasPrefix(msg, "AUTH_FAILED"):
+				c.failSession(newAuthFailedError(msg))
+				return
+			case strings.HasPrefix(msg, "HALT"):
+				c.failSession(fmt.Errorf("openvpn server sent halt: %q", msg))
+				return
+			case strings.HasPrefix(msg, "RESTART"):
+				c.failSession(fmt.Errorf("openvpn server requested restart: %q", msg))
+				return
+			default:
+				// INFO, PUSH_REPLY updates and unknown messages are
+				// acknowledged by the transport and ignored for now.
+			}
+		}
+	}()
+}
+
+func (c *Client) failSession(err error) {
+	c.sessionErr.CompareAndSwap(nil, &err)
+	_ = c.Close()
+}
+
+// SessionErr reports why the session was terminated, if the reason is known.
+func (c *Client) SessionErr() error {
+	if p := c.sessionErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (c *Client) WriteIPPacket(ctx context.Context, packet []byte) error {
@@ -364,9 +428,10 @@ func (c *Client) readControlMessage(ctx context.Context) (string, error) {
 		if msg, ok := c.takeControlMessage(); ok {
 			return msg, nil
 		}
-		if deadline, ok := ctx.Deadline(); ok {
-			_ = c.tlsConn.SetReadDeadline(deadline)
-		}
+		// Always apply the context deadline; a zero time clears any stale
+		// deadline left over from an earlier phase.
+		deadline, _ := ctx.Deadline()
+		_ = c.tlsConn.SetReadDeadline(deadline)
 		n, err := c.tlsConn.Read(tmp)
 		if n > 0 {
 			c.tlsReadBuf = append(c.tlsReadBuf, tmp[:n]...)

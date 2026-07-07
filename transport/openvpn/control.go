@@ -199,6 +199,13 @@ func (c *ControlChannel) Read(ctx context.Context) (*ControlPacket, error) {
 		for _, ackID := range packet.AckIDs {
 			delete(c.pending, ackID)
 		}
+		if packet.Opcode == PControlSoftResetV1 {
+			// A soft reset opens a new key session: its message id lives in
+			// a fresh reliable-layer space, so it must not be merged into
+			// (or ACKed within) the current stream. Surface it directly.
+			c.mu.Unlock()
+			return packet, nil
+		}
 		if packet.Opcode.HasMessageID() {
 			c.ackPending = appendAck(c.ackPending, packet.MessageID)
 		}
@@ -388,10 +395,22 @@ type ControlConn struct {
 	readBuf []byte
 	closed  bool
 	mu      sync.Mutex
+
+	// notify, when set, observes non-P_CONTROL_V1 packets (e.g. soft
+	// resets) seen while reading the TLS stream. A returned error aborts
+	// the read, surfacing session-level events through the TLS layer.
+	notify func(*ControlPacket) error
 }
 
 func NewControlConn(channel *ControlChannel) *ControlConn {
 	return &ControlConn{channel: channel}
+}
+
+// SetNotify installs the observer for non-TLS control packets. It must be
+// set before the next Read; there is no synchronization with a concurrent
+// reader.
+func (c *ControlConn) SetNotify(notify func(*ControlPacket) error) {
+	c.notify = notify
 }
 
 func (c *ControlConn) Read(b []byte) (int, error) {
@@ -414,6 +433,11 @@ func (c *ControlConn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 		if packet.Opcode != PControlV1 {
+			if c.notify != nil {
+				if err := c.notify(packet); err != nil {
+					return 0, err
+				}
+			}
 			if err := c.channel.SendAck(context.Background()); err != nil {
 				return 0, err
 			}
