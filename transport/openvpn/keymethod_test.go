@@ -93,9 +93,10 @@ func TestInstallScriptOptionsCBCSHA1(t *testing.T) {
 }
 
 func TestInstallScriptPeerInfo(t *testing.T) {
-	// Without user-defined peer-info the output is unchanged (backward compatible).
+	// The configured cipher is advertised first, followed by the other AEAD
+	// ciphers so the server can pick one via NCP.
 	base := InstallScriptPeerInfo(CipherAES128GCM, "", nil)
-	if base != "IV_VER=mihomo-openvpn\nIV_PROTO=6\nIV_CIPHERS=AES-128-GCM\n" {
+	if base != "IV_VER=mihomo-openvpn\nIV_PROTO=6\nIV_CIPHERS=AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305\n" {
 		t.Fatalf("unexpected default peer-info: %q", base)
 	}
 
@@ -107,6 +108,15 @@ func TestInstallScriptPeerInfo(t *testing.T) {
 	want := base + "IV_HWADDR=52:54:00:ff:72:87\nUV_DEVICE_ID=laptop-001\n"
 	if info != want {
 		t.Fatalf("unexpected peer-info:\n got %q\nwant %q", info, want)
+	}
+}
+
+func TestDataCiphersListPutsConfiguredFirst(t *testing.T) {
+	if got := dataCiphersList(CipherAES256GCM); got != "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305" {
+		t.Fatalf("unexpected cipher list: %q", got)
+	}
+	if got := dataCiphersList(CipherChaCha20Poly1305); got != "CHACHA20-POLY1305:AES-256-GCM:AES-128-GCM" {
+		t.Fatalf("unexpected cipher list: %q", got)
 	}
 }
 

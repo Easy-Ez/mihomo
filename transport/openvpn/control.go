@@ -52,12 +52,12 @@ type pendingControl struct {
 }
 
 type ControlChannel struct {
-	io     PacketIO
-	crypt  *TLSCrypt
-	clock  func() time.Time
-	keyID  uint8
-	local  SessionID
-	remote SessionID
+	io      PacketIO
+	wrapper ControlWrapper
+	clock   func() time.Time
+	keyID   uint8
+	local   SessionID
+	remote  SessionID
 
 	mu            sync.Mutex
 	sendPacketID  uint32
@@ -70,10 +70,10 @@ type ControlChannel struct {
 	writeDeadline time.Time
 }
 
-func NewControlChannel(io PacketIO, crypt *TLSCrypt, local SessionID) *ControlChannel {
+func NewControlChannel(io PacketIO, wrapper ControlWrapper, local SessionID) *ControlChannel {
 	return &ControlChannel{
 		io:          io,
-		crypt:       crypt,
+		wrapper:     wrapper,
 		clock:       time.Now,
 		local:       local,
 		pending:     make(map[uint32]*pendingControl),
@@ -366,7 +366,7 @@ func (c *ControlChannel) writeControlPacket(ctx context.Context, packet *Control
 		defer cancel()
 	}
 
-	encoded, err := packet.Encode(c.crypt, packetID, unixTime)
+	encoded, err := packet.Encode(c.wrapper, packetID, unixTime)
 	if err != nil {
 		return err
 	}
@@ -388,7 +388,7 @@ func (c *ControlChannel) readControlPacket(ctx context.Context) (*ControlPacket,
 	if err != nil {
 		return nil, err
 	}
-	packet, _, _, err := DecodeControlPacket(c.crypt, raw)
+	packet, _, _, err := DecodeControlPacket(c.wrapper, raw)
 	return packet, err
 }
 

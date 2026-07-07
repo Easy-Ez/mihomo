@@ -167,7 +167,7 @@ func DecodeControlPlain(opcode Opcode, plain []byte) (ackIDs []uint32, ackRemote
 	return ackIDs, ackRemote, messageID, payload, nil
 }
 
-func (p ControlPacket) Encode(crypt *TLSCrypt, packetID uint32, unixTime uint32) ([]byte, error) {
+func (p ControlPacket) Encode(wrapper ControlWrapper, packetID uint32, unixTime uint32) ([]byte, error) {
 	plain, err := p.EncodePlain()
 	if err != nil {
 		return nil, err
@@ -176,17 +176,17 @@ func (p ControlPacket) Encode(crypt *TLSCrypt, packetID uint32, unixTime uint32)
 	header := make([]byte, TLSCryptHeaderSize)
 	header[0] = opcodeKeyID(p.Opcode, p.KeyID)
 	copy(header[1:], p.LocalSession[:])
-	if crypt == nil {
+	if wrapper == nil {
 		out := make([]byte, 0, len(header)+len(plain))
 		out = append(out, header...)
 		out = append(out, plain...)
 		return out, nil
 	}
-	return crypt.Wrap(header, packetID, unixTime, plain)
+	return wrapper.Wrap(header, packetID, unixTime, plain)
 }
 
-func DecodeControlPacket(crypt *TLSCrypt, packet []byte) (*ControlPacket, uint32, uint32, error) {
-	if crypt == nil {
+func DecodeControlPacket(wrapper ControlWrapper, packet []byte) (*ControlPacket, uint32, uint32, error) {
+	if wrapper == nil {
 		if len(packet) < TLSCryptHeaderSize+1 {
 			return nil, 0, 0, errors.New("control packet too short")
 		}
@@ -211,7 +211,7 @@ func DecodeControlPacket(crypt *TLSCrypt, packet []byte) (*ControlPacket, uint32
 			Payload:          payload,
 		}, 0, 0, nil
 	}
-	header, packetID, unixTime, plain, err := crypt.Unwrap(packet)
+	header, packetID, unixTime, plain, err := wrapper.Unwrap(packet)
 	if err != nil {
 		return nil, 0, 0, err
 	}

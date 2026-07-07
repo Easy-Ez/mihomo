@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"sort"
+	"strings"
 )
 
 const (
@@ -194,7 +195,7 @@ func InstallScriptPeerInfo(cipher string, compLZO string, peerInfo map[string]st
 	if compLZO == CompLzoYes {
 		lzo = "IV_LZO=1\n"
 	}
-	info := fmt.Sprintf("IV_VER=mihomo-openvpn\nIV_PROTO=6\n%sIV_CIPHERS=%s\n", lzo, cipher)
+	info := fmt.Sprintf("IV_VER=mihomo-openvpn\nIV_PROTO=6\n%sIV_CIPHERS=%s\n", lzo, dataCiphersList(cipher))
 	// Append user-defined peer-info entries (e.g. IV_HWADDR, UV_*) after the
 	// built-in fields. Keys are sorted so the output is deterministic.
 	keys := make([]string, 0, len(peerInfo))
@@ -206,6 +207,20 @@ func InstallScriptPeerInfo(cipher string, compLZO string, peerInfo map[string]st
 		info += fmt.Sprintf("%s=%s\n", key, peerInfo[key])
 	}
 	return info
+}
+
+// dataCiphersList builds the IV_CIPHERS advertisement: the configured
+// cipher first (so a server honoring order prefers it) followed by the
+// common AEAD ciphers this client can also run. Advertising several lets
+// the server pick via NCP; the choice is applied from the pushed "cipher".
+func dataCiphersList(cipher string) string {
+	ciphers := []string{cipher}
+	for _, candidate := range []string{CipherAES256GCM, CipherAES128GCM, CipherChaCha20Poly1305} {
+		if candidate != cipher {
+			ciphers = append(ciphers, candidate)
+		}
+	}
+	return strings.Join(ciphers, ":")
 }
 
 func appendOpenVPNString(out []byte, s string) []byte {

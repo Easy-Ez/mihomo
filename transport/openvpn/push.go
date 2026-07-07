@@ -34,6 +34,9 @@ type PushReply struct {
 	Ping        time.Duration
 	PingRestart time.Duration
 
+	// Cipher is the data cipher the server selected via NCP, if any.
+	Cipher string
+
 	// AuthToken (and the optional AuthTokenUser it comes with) replaces
 	// the password (and username) on later renegotiations when the server
 	// runs --auth-gen-token.
@@ -129,6 +132,10 @@ func ParsePushReplyMessages(messages []string) (*PushReply, error) {
 				if seconds, err := strconv.Atoi(fields[1]); err == nil && seconds > 0 {
 					reply.PingRestart = time.Duration(seconds) * time.Second
 				}
+			}
+		case "cipher":
+			if len(fields) >= 2 {
+				reply.Cipher = fields[1]
 			}
 		case "auth-token":
 			if len(fields) >= 2 {

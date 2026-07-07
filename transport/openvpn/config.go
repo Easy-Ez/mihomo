@@ -47,6 +47,10 @@ type ClientConfig struct {
 	Cert     []byte
 	Key      []byte
 	TLSCrypt []byte
+	TLSAuth  []byte
+	// KeyDirection is the --tls-auth / --key-direction value (default
+	// KeyDirectionClient). Ignored unless TLSAuth is set.
+	KeyDirection int
 
 	Username string
 	Password string
@@ -57,17 +61,35 @@ type ClientConfig struct {
 	PingRestart  time.Duration
 
 	TLSCryptKey []byte
+	TLSAuthKey  []byte
 }
 
-// DataCipherKeyLength returns the key size for the negotiated data cipher.
+// DataCipherKeyLength returns the key size for the configured data cipher.
 func (c ClientConfig) DataCipherKeyLength() int {
-	switch c.Cipher {
+	return cipherKeyLength(c.Cipher)
+}
+
+// cipherKeyLength returns the key size in bytes for a data cipher.
+func cipherKeyLength(cipher string) int {
+	switch cipher {
 	case CipherAES256GCM, CipherAES256CBC, CipherChaCha20Poly1305:
 		return 32
 	case CipherAES192GCM, CipherAES192CBC:
 		return 24
 	default:
 		return 16
+	}
+}
+
+// isSupportedCipher reports whether the data cipher can be used by the data
+// channel (covers both the configured cipher and one negotiated via NCP).
+func isSupportedCipher(cipher string) bool {
+	switch cipher {
+	case CipherAES128GCM, CipherAES192GCM, CipherAES256GCM,
+		CipherAES128CBC, CipherAES192CBC, CipherAES256CBC, CipherChaCha20Poly1305:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -135,12 +157,27 @@ func (c *ClientConfig) Prepare() error {
 	if err := c.ValidateInstallScriptSubset(); err != nil {
 		return err
 	}
-	if len(bytes.TrimSpace(c.TLSCrypt)) > 0 {
+	hasCrypt := len(bytes.TrimSpace(c.TLSCrypt)) > 0
+	hasAuth := len(bytes.TrimSpace(c.TLSAuth)) > 0
+	if hasCrypt && hasAuth {
+		return errors.New("openvpn config cannot set both tls-crypt and tls-auth")
+	}
+	if hasCrypt {
 		key, err := DecodeStaticKey(c.TLSCrypt)
 		if err != nil {
 			return fmt.Errorf("parse tls-crypt key: %w", err)
 		}
 		c.TLSCryptKey = key
+	}
+	if hasAuth {
+		key, err := DecodeStaticKey(c.TLSAuth)
+		if err != nil {
+			return fmt.Errorf("parse tls-auth key: %w", err)
+		}
+		c.TLSAuthKey = key
+		if c.KeyDirection != KeyDirectionServer && c.KeyDirection != KeyDirectionClient && c.KeyDirection != KeyDirectionBidirectional {
+			return fmt.Errorf("invalid openvpn key-direction %d: expected 0, 1 or -1", c.KeyDirection)
+		}
 	}
 	return nil
 }
@@ -158,7 +195,7 @@ func (c *ClientConfig) ValidateInstallScriptSubset() error {
 	if c.Proto != ProtoUDP && c.Proto != ProtoTCP {
 		return fmt.Errorf("unsupported openvpn proto %q: only udp and tcp are supported", c.Proto)
 	}
-	if c.Cipher != CipherAES128GCM && c.Cipher != CipherAES192GCM && c.Cipher != CipherAES256GCM && c.Cipher != CipherAES128CBC && c.Cipher != CipherAES192CBC && c.Cipher != CipherAES256CBC && c.Cipher != CipherChaCha20Poly1305 {
+	if !isSupportedCipher(c.Cipher) {
 		return fmt.Errorf("unsupported openvpn cipher %q: only %s, %s, %s, %s, %s, %s and %s are supported", c.Cipher, CipherAES128GCM, CipherAES192GCM, CipherAES256GCM, CipherAES128CBC, CipherAES192CBC, CipherAES256CBC, CipherChaCha20Poly1305)
 	}
 	if c.Auth != AuthMD5 && c.Auth != AuthSHA1 && c.Auth != AuthSHA256 && c.Auth != AuthSHA384 && c.Auth != AuthSHA512 {

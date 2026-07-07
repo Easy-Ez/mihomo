@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/log"
+
 	"github.com/metacubex/tls"
 	"golang.org/x/sync/semaphore"
 )
@@ -46,6 +48,10 @@ type Client struct {
 	sessionErr atomic.Pointer[error]
 	runCtx     context.Context
 
+	// cipher is the data cipher in effect: the configured one, or the one
+	// the server selected via NCP and pushed back.
+	cipher string
+
 	// optionsString is the OCC options string sent in the key method 2
 	// record; it is also echoed in OCC_REPLY when the server probes us.
 	optionsString string
@@ -68,13 +74,24 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	if io == nil {
 		return nil, errors.New("nil openvpn packet io")
 	}
-	var crypt *TLSCrypt
-	if len(config.TLSCryptKey) > 0 {
-		var err error
-		crypt, err = NewTLSCrypt(config.TLSCryptKey, true)
+	var wrapper ControlWrapper
+	switch {
+	case len(config.TLSCryptKey) > 0:
+		crypt, err := NewTLSCrypt(config.TLSCryptKey, true)
 		if err != nil {
 			return nil, err
 		}
+		wrapper = crypt
+		log.Debugln("[OpenVPN] control channel protection: tls-crypt")
+	case len(config.TLSAuthKey) > 0:
+		auth, err := NewTLSAuth(config.TLSAuthKey, config.Auth, config.KeyDirection)
+		if err != nil {
+			return nil, err
+		}
+		wrapper = auth
+		log.Debugln("[OpenVPN] control channel protection: tls-auth (auth=%s, key-direction=%d)", config.Auth, config.KeyDirection)
+	default:
+		log.Debugln("[OpenVPN] control channel protection: none (plaintext)")
 	}
 	local, err := NewSessionID()
 	if err != nil {
@@ -86,7 +103,7 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	client := &Client{
 		config:   config,
 		mux:      mux,
-		control:  NewControlChannel(mux, crypt, local),
+		control:  NewControlChannel(mux, wrapper, local),
 		cancel:   cancel,
 		runCtx:   runCtx,
 		writeSem: semaphore.NewWeighted(1),
@@ -108,7 +125,7 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 
-	keys, err := c.negotiateKeys(ctx)
+	sources, err := c.negotiateKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +138,12 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 	c.push = push
-	data, err := NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, c.control.CurrentKeyID())
+	cipher, err := c.negotiateCipher(push)
+	if err != nil {
+		return nil, err
+	}
+	c.cipher = cipher
+	data, err := c.buildDataChannel(sources, cipher, c.control.CurrentKeyID(), push.PeerID)
 	if err != nil {
 		return nil, err
 	}
@@ -136,11 +158,12 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 }
 
 // negotiateKeys runs a full TLS handshake plus key-method-2 exchange over
-// the control channel's current key session and derives the data channel
-// key material. It is used both for the initial handshake and for every
+// the control channel's current key session and returns the combined key
+// sources. It is used both for the initial handshake and for every
 // renegotiation (where the credentials may be replaced by a pushed
-// auth-token).
-func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
+// auth-token). Key material is derived later, once the data cipher is known
+// (it may be selected by the server via NCP).
+func (c *Client) negotiateKeys(ctx context.Context) (*KeySource2, error) {
 	tlsConfig, err := c.tlsConfig()
 	if err != nil {
 		return nil, err
@@ -197,11 +220,35 @@ func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
 
 	sources := clientRecord.Sources
 	sources.Server = serverRecord.Sources.Server
-	keys, err := DeriveClientKeyMaterial(sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), c.config.DataCipherKeyLength())
+	return &sources, nil
+}
+
+// negotiateCipher applies the data cipher the server selected through NCP
+// (pushed back as "cipher X"). It falls back to the configured cipher when
+// the server pushes nothing, and rejects a cipher this client cannot run.
+func (c *Client) negotiateCipher(push *PushReply) (string, error) {
+	if push == nil || push.Cipher == "" {
+		return c.config.Cipher, nil
+	}
+	negotiated := normalizeCipher(push.Cipher)
+	if !isSupportedCipher(negotiated) {
+		return "", fmt.Errorf("server negotiated unsupported data cipher %q", push.Cipher)
+	}
+	if negotiated != c.config.Cipher {
+		log.Infoln("[OpenVPN] server negotiated data cipher %s (configured %s)", negotiated, c.config.Cipher)
+	}
+	return negotiated, nil
+}
+
+// buildDataChannel derives key material for the given cipher and key id and
+// constructs the data channel. The cipher governs the key length, so this
+// must run after NCP has settled the cipher.
+func (c *Client) buildDataChannel(sources *KeySource2, cipher string, keyID uint8, peerID uint32) (*DataChannel, error) {
+	keys, err := DeriveClientKeyMaterial(*sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), cipherKeyLength(cipher))
 	if err != nil {
 		return nil, fmt.Errorf("derive data channel keys: %w", err)
 	}
-	return keys, nil
+	return NewDataChannel(keys, cipher, c.config.Auth, peerID, keyID)
 }
 
 // ErrRenegotiationRequested is used internally to unwind the TLS read path
@@ -233,21 +280,25 @@ func (c *Client) renegotiate() error {
 	ctx, cancel := context.WithTimeout(c.runCtx, RenegotiationTimeout)
 	defer cancel()
 
+	push := c.push
+	if push == nil {
+		return errors.New("renegotiation before initial push reply")
+	}
+	log.Debugln("[OpenVPN] key renegotiation started (new key-id %d)", keyID)
+
 	c.control.StartKeySession(keyID)
 	// The server's soft reset is message 0 of the new stream: ACK it so
 	// the server proceeds with its TLS flight.
 	if err := c.control.SendAck(ctx); err != nil {
 		return fmt.Errorf("ack soft reset: %w", err)
 	}
-	keys, err := c.negotiateKeys(ctx)
+	sources, err := c.negotiateKeys(ctx)
 	if err != nil {
 		return err
 	}
-	push := c.push
-	if push == nil {
-		return errors.New("renegotiation before initial push reply")
-	}
-	newData, err := NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, keyID)
+	// Reuse the cipher settled at the initial handshake; servers do not
+	// renegotiate the data cipher.
+	newData, err := c.buildDataChannel(sources, c.cipher, keyID, push.PeerID)
 	if err != nil {
 		return err
 	}
@@ -255,6 +306,7 @@ func (c *Client) renegotiate() error {
 	// decrypting packets still in flight (lame duck).
 	c.dataOld.Store(c.data.Swap(newData))
 	c.markReceive()
+	log.Debugln("[OpenVPN] key renegotiation complete (key-id %d)", keyID)
 	return nil
 }
 

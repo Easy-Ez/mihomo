@@ -63,6 +63,33 @@ func TestParsePushReplyAuthToken(t *testing.T) {
 	}
 }
 
+func TestParsePushReplyCipher(t *testing.T) {
+	reply, err := ParsePushReply("PUSH_REPLY,cipher AES-256-GCM,ifconfig 10.8.0.2 255.255.255.0\x00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Cipher != "AES-256-GCM" {
+		t.Fatalf("unexpected pushed cipher: %q", reply.Cipher)
+	}
+}
+
+func TestNegotiateCipher(t *testing.T) {
+	c := &Client{config: &ClientConfig{Cipher: CipherAES128GCM}}
+
+	// No pushed cipher: keep the configured one.
+	if got, err := c.negotiateCipher(&PushReply{}); err != nil || got != CipherAES128GCM {
+		t.Fatalf("expected configured cipher, got %q err=%v", got, err)
+	}
+	// Server selects a different supported cipher: adopt it.
+	if got, err := c.negotiateCipher(&PushReply{Cipher: "AES-256-GCM"}); err != nil || got != CipherAES256GCM {
+		t.Fatalf("expected negotiated AES-256-GCM, got %q err=%v", got, err)
+	}
+	// Unsupported cipher: fail clearly rather than silently mis-decrypt.
+	if _, err := c.negotiateCipher(&PushReply{Cipher: "BF-CBC"}); err == nil {
+		t.Fatal("expected error for unsupported negotiated cipher")
+	}
+}
+
 func TestParsePushReplyMessagesRejectsNonPush(t *testing.T) {
 	if _, err := ParsePushReplyMessages([]string{"AUTH_FAILED"}); err == nil {
 		t.Fatal("expected error for non-push message")

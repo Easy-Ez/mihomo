@@ -53,6 +53,8 @@ type OpenVPNOption struct {
 	Cert             string            `proxy:"cert,omitempty"`
 	Key              string            `proxy:"key,omitempty"`
 	TLSCrypt         string            `proxy:"tls-crypt,omitempty"`
+	TLSAuth          string            `proxy:"tls-auth,omitempty"`
+	KeyDirection     int               `proxy:"key-direction,omitempty"`
 	Username         string            `proxy:"username,omitempty"`
 	Password         string            `proxy:"password,omitempty"`
 	PeerInfo         map[string]string `proxy:"peer-info,omitempty"`
@@ -71,22 +73,31 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
 		return nil, errors.New("openvpn handshake timeout must be non-negative")
 	}
 	cfg := &ovpn.ClientConfig{
-		RemoteHost:   option.Server,
-		RemotePort:   uint16(option.Port),
-		Proto:        option.Proto,
-		Dev:          option.Dev,
-		Cipher:       option.Cipher,
-		Auth:         option.Auth,
-		CompLZO:      option.CompLZO,
-		CA:           []byte(option.CA),
-		Cert:         []byte(option.Cert),
-		Key:          []byte(option.Key),
-		TLSCrypt:     []byte(option.TLSCrypt),
+		RemoteHost: option.Server,
+		RemotePort: uint16(option.Port),
+		Proto:      option.Proto,
+		Dev:        option.Dev,
+		Cipher:     option.Cipher,
+		Auth:       option.Auth,
+		CompLZO:    option.CompLZO,
+		CA:         []byte(option.CA),
+		Cert:       []byte(option.Cert),
+		Key:        []byte(option.Key),
+		TLSCrypt:   []byte(option.TLSCrypt),
+		TLSAuth:    []byte(option.TLSAuth),
+		// A client's tls-auth uses key-direction 1 by convention; treat the
+		// zero value (unset) as that default. Use -1 for a bidirectional key.
+		KeyDirection: option.KeyDirection,
 		Username:     option.Username,
 		Password:     option.Password,
 		PeerInfo:     option.PeerInfo,
 		PingInterval: time.Duration(option.Ping) * time.Second,
 		PingRestart:  time.Duration(option.PingRestart) * time.Second,
+	}
+	// tls-auth on a client conventionally uses key-direction 1; the option's
+	// zero value means "unset", so default it here (use -1 for bidirectional).
+	if len(option.TLSAuth) > 0 && option.KeyDirection == 0 {
+		cfg.KeyDirection = ovpn.KeyDirectionClient
 	}
 	if err := cfg.Prepare(); err != nil {
 		return nil, err
