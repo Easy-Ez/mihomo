@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -359,6 +360,125 @@ func TestClientWaitServerResetAcksServerReset(t *testing.T) {
 	}
 	if serverControl.PendingMessages() != 0 {
 		t.Fatalf("expected server reset to be acked, pending=%d", serverControl.PendingMessages())
+	}
+}
+
+func TestControlConnFragmentsLargeWrites(t *testing.T) {
+	client, server := newTestChannels(t)
+	client.SetRemoteSessionID(server.LocalSessionID())
+	server.SetRemoteSessionID(client.LocalSessionID())
+	clientConn := NewControlConn(client)
+
+	payload := bytes.Repeat([]byte{0xAB}, 2*maxControlPayload+123)
+	n, err := clientConn.Write(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(payload) {
+		t.Fatalf("short write: %d of %d", n, len(payload))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var got []byte
+	packets := 0
+	for len(got) < len(payload) {
+		packet, err := server.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if packet.Opcode != PControlV1 {
+			t.Fatalf("unexpected opcode %s", packet.Opcode)
+		}
+		if len(packet.Payload) > maxControlPayload {
+			t.Fatalf("fragment exceeds cap: %d", len(packet.Payload))
+		}
+		got = append(got, packet.Payload...)
+		packets++
+	}
+	if packets != 3 {
+		t.Fatalf("expected 3 fragments, got %d", packets)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("reassembled payload mismatch")
+	}
+}
+
+func TestSendAckSplitsBacklog(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+
+	control.mu.Lock()
+	for i := uint32(0); i < 20; i++ {
+		control.ackPending = append(control.ackPending, i)
+	}
+	control.mu.Unlock()
+
+	ctx := context.Background()
+	if err := control.SendAck(ctx); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[uint32]bool)
+	sizes := make([]int, 0, 3)
+	for i := 0; i < 3; i++ {
+		raw, err := serverIO.ReadPacket(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packet, _, _, err := DecodeControlPacket(nil, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if packet.Opcode != PAckV1 {
+			t.Fatalf("unexpected opcode %s", packet.Opcode)
+		}
+		if len(packet.AckIDs) > reliableAckSize {
+			t.Fatalf("ack packet exceeds RELIABLE_ACK_SIZE: %d", len(packet.AckIDs))
+		}
+		sizes = append(sizes, len(packet.AckIDs))
+		for _, id := range packet.AckIDs {
+			seen[id] = true
+		}
+	}
+	if len(seen) != 20 {
+		t.Fatalf("expected 20 distinct acked ids, got %d (sizes %v)", len(seen), sizes)
+	}
+}
+
+func TestSendCapsPiggybackedAcks(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+
+	control.mu.Lock()
+	for i := uint32(0); i < 10; i++ {
+		control.ackPending = append(control.ackPending, i)
+	}
+	control.mu.Unlock()
+
+	ctx := context.Background()
+	if _, err := control.Send(ctx, PControlV1, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := serverIO.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _, _, err := DecodeControlPacket(nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packet.AckIDs) != controlSendAckMax {
+		t.Fatalf("expected %d piggybacked acks, got %d", controlSendAckMax, len(packet.AckIDs))
+	}
+	control.mu.Lock()
+	remaining := len(control.ackPending)
+	control.mu.Unlock()
+	if remaining != 10-controlSendAckMax {
+		t.Fatalf("expected %d acks left in backlog, got %d", 10-controlSendAckMax, remaining)
 	}
 }
 

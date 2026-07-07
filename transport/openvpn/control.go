@@ -25,6 +25,22 @@ const (
 	// packet is retransmitted after 2 seconds, doubling per attempt.
 	ControlRetransmitInterval    = 2 * time.Second
 	ControlRetransmitMaxInterval = 16 * time.Second
+
+	// maxControlPayload caps the TLS bytes carried by one P_CONTROL_V1.
+	// The reference implementation limits whole control packets to
+	// --max-packet-size (default 1250); after the worst-case tls-crypt,
+	// session, ACK and message-id overhead (~80 bytes) a 1024-byte payload
+	// keeps every control packet safely below common path MTUs, so large
+	// TLS flights (client certificates!) no longer rely on IP
+	// fragmentation, which many networks drop.
+	maxControlPayload = 1024
+
+	// controlSendAckMax mirrors CONTROL_SEND_ACK_MAX: at most this many
+	// ACKs hitch a ride on an outgoing non-P_ACK_V1 control packet.
+	controlSendAckMax = 4
+	// reliableAckSize mirrors RELIABLE_ACK_SIZE: the largest ACK array a
+	// standalone P_ACK_V1 may carry.
+	reliableAckSize = 8
 )
 
 // pendingControl tracks an outgoing reliable packet awaiting an ACK,
@@ -98,12 +114,11 @@ func (c *ControlChannel) Send(ctx context.Context, opcode Opcode, payload []byte
 		Opcode:           opcode,
 		KeyID:            c.keyID,
 		LocalSession:     c.local,
-		AckIDs:           append([]uint32(nil), c.ackPending...),
+		AckIDs:           c.takeAcksLocked(controlSendAckMax),
 		AckRemoteSession: c.remote,
 		MessageID:        messageID,
 		Payload:          cloneBytes(payload),
 	}
-	c.ackPending = nil
 	c.pending[messageID] = &pendingControl{
 		packet:   packet,
 		nextSend: c.clock().Add(ControlRetransmitInterval),
@@ -117,22 +132,45 @@ func (c *ControlChannel) Send(ctx context.Context, opcode Opcode, payload []byte
 	return messageID, nil
 }
 
-func (c *ControlChannel) SendAck(ctx context.Context) error {
-	c.mu.Lock()
+// takeAcksLocked removes and returns at most limit pending ACK ids;
+// c.mu must be held.
+func (c *ControlChannel) takeAcksLocked(limit int) []uint32 {
 	if len(c.ackPending) == 0 {
-		c.mu.Unlock()
 		return nil
 	}
-	packet := &ControlPacket{
-		Opcode:           PAckV1,
-		KeyID:            c.keyID,
-		LocalSession:     c.local,
-		AckIDs:           append([]uint32(nil), c.ackPending...),
-		AckRemoteSession: c.remote,
+	n := len(c.ackPending)
+	if n > limit {
+		n = limit
 	}
-	c.ackPending = nil
-	c.mu.Unlock()
-	return c.writeControlPacket(ctx, packet)
+	acks := append([]uint32(nil), c.ackPending[:n]...)
+	if n == len(c.ackPending) {
+		c.ackPending = nil
+	} else {
+		c.ackPending = append([]uint32(nil), c.ackPending[n:]...)
+	}
+	return acks
+}
+
+func (c *ControlChannel) SendAck(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		acks := c.takeAcksLocked(reliableAckSize)
+		if len(acks) == 0 {
+			c.mu.Unlock()
+			return nil
+		}
+		packet := &ControlPacket{
+			Opcode:           PAckV1,
+			KeyID:            c.keyID,
+			LocalSession:     c.local,
+			AckIDs:           acks,
+			AckRemoteSession: c.remote,
+		}
+		c.mu.Unlock()
+		if err := c.writeControlPacket(ctx, packet); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *ControlChannel) Read(ctx context.Context) (*ControlPacket, error) {
@@ -225,12 +263,12 @@ func (c *ControlChannel) RetransmitDue(ctx context.Context) (time.Duration, erro
 				entry.interval = ControlRetransmitMaxInterval
 			}
 			entry.nextSend = now.Add(entry.interval)
-			// Retransmissions carry the current ACK backlog and always get
-			// a fresh tls-crypt packet id (assigned in writeControlPacket).
+			// Retransmissions carry part of the current ACK backlog and
+			// always get a fresh tls-crypt packet id (assigned in
+			// writeControlPacket).
 			cp := *entry.packet
-			cp.AckIDs = append([]uint32(nil), c.ackPending...)
+			cp.AckIDs = c.takeAcksLocked(controlSendAckMax)
 			cp.AckRemoteSession = c.remote
-			c.ackPending = nil
 			due = append(due, &cp)
 		}
 		if until := entry.nextSend.Sub(now); until < wait {
@@ -405,10 +443,23 @@ func (c *ControlConn) Write(b []byte) (int, error) {
 	}
 	c.mu.Unlock()
 
-	if _, err := c.channel.Send(context.Background(), PControlV1, b); err != nil {
-		return 0, err
+	// Fragment the TLS byte stream: one oversized control packet would be
+	// sent as a fragmented IP datagram over UDP, which many paths drop.
+	// The peer's reliability layer reassembles the stream from the
+	// per-message ids, so chunk boundaries are invisible to TLS.
+	total := 0
+	for len(b) > 0 {
+		chunk := b
+		if len(chunk) > maxControlPayload {
+			chunk = b[:maxControlPayload]
+		}
+		if _, err := c.channel.Send(context.Background(), PControlV1, chunk); err != nil {
+			return total, err
+		}
+		total += len(chunk)
+		b = b[len(chunk):]
 	}
-	return len(b), nil
+	return total, nil
 }
 
 func (c *ControlConn) Close() error {
