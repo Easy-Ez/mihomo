@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,15 +20,29 @@ type Client struct {
 	config *ClientConfig
 	mux    *PacketMux
 
-	control     *ControlChannel
+	control *ControlChannel
+	push    *PushReply
+
+	// connMu guards replacement of controlConn/tlsConn during
+	// renegotiation; readers inside the keeper goroutine (the only writer
+	// after startup) may access the fields directly.
+	connMu      sync.Mutex
 	controlConn *ControlConn
 	tlsConn     *tls.Conn
-	data        *DataChannel
-	push        *PushReply
 
-	// sessionErr records why the session died (AUTH_FAILED, HALT, soft
-	// reset, ...) so the adapter can log something actionable instead of
-	// a generic "connection closed".
+	// data is the key session used for sending; dataOld keeps the previous
+	// key alive for decrypting in-flight packets after a renegotiation
+	// (lame duck), routed by the key id in each packet header.
+	data    atomic.Pointer[DataChannel]
+	dataOld atomic.Pointer[DataChannel]
+
+	// softResetKeyID carries the key id of the server's soft reset from
+	// the transport notify hook to the renegotiation handler.
+	softResetKeyID atomic.Uint32
+
+	// sessionErr records why the session died (AUTH_FAILED, HALT, failed
+	// renegotiation, ...) so the adapter can log something actionable
+	// instead of a generic "connection closed".
 	sessionErr atomic.Pointer[error]
 	runCtx     context.Context
 
@@ -93,25 +108,77 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 
+	keys, err := c.negotiateKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := c.tlsConn.Write([]byte(PushRequest + "\x00")); err != nil {
+		return nil, fmt.Errorf("write push request: %w", err)
+	}
+	push, err := c.readPushReply(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.push = push
+	data, err := NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, c.control.CurrentKeyID())
+	if err != nil {
+		return nil, err
+	}
+	c.data.Store(data)
+	// The server answered PUSH_REPLY, so it received everything we sent.
+	// Drop any packet still awaiting an ACK before the keeper takes over.
+	c.control.ClearPending()
+	c.startControlKeeper()
+	c.markSend()
+	c.markReceive()
+	return push, nil
+}
+
+// negotiateKeys runs a full TLS handshake plus key-method-2 exchange over
+// the control channel's current key session and derives the data channel
+// key material. It is used both for the initial handshake and for every
+// renegotiation (where the credentials may be replaced by a pushed
+// auth-token).
+func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
 	tlsConfig, err := c.tlsConfig()
 	if err != nil {
 		return nil, err
 	}
-	c.controlConn = NewControlConn(c.control)
-	c.tlsConn = tls.Client(c.controlConn, tlsConfig)
+	controlConn := NewControlConn(c.control)
+	controlConn.SetNotify(c.notifyControlPacket)
+	tlsConn := tls.Client(controlConn, tlsConfig)
+	c.connMu.Lock()
+	c.controlConn = controlConn
+	c.tlsConn = tlsConn
+	c.connMu.Unlock()
+	c.tlsReadBuf = nil
+
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = c.tlsConn.SetDeadline(deadline)
+		_ = tlsConn.SetDeadline(deadline)
 	}
-	if err := c.tlsConn.HandshakeContext(ctx); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("openvpn tls handshake: %w", err)
 	}
 
-	c.optionsString = InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO)
+	if c.optionsString == "" {
+		c.optionsString = InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO)
+	}
+	username := strings.TrimSpace(c.config.Username)
+	password := c.config.Password
+	if push := c.push; push != nil && push.AuthToken != "" {
+		// Renegotiations authenticate with the server-issued session token
+		// (--auth-gen-token servers reject the original password here).
+		password = push.AuthToken
+		if push.AuthTokenUser != "" {
+			username = push.AuthTokenUser
+		}
+	}
 	clientRecord, err := NewClientKeyMethod2Record(
 		c.optionsString,
 		InstallScriptPeerInfo(c.config.Cipher, c.config.CompLZO, c.config.PeerInfo),
-		strings.TrimSpace(c.config.Username),
-		c.config.Password,
+		username,
+		password,
 	)
 	if err != nil {
 		return nil, err
@@ -120,7 +187,7 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.tlsConn.Write(clientBytes); err != nil {
+	if _, err := tlsConn.Write(clientBytes); err != nil {
 		return nil, fmt.Errorf("write key method 2 client record: %w", err)
 	}
 	serverRecord, err := c.readServerKeyMethod(ctx)
@@ -134,49 +201,81 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, fmt.Errorf("derive data channel keys: %w", err)
 	}
-
-	if _, err := c.tlsConn.Write([]byte(PushRequest + "\x00")); err != nil {
-		return nil, fmt.Errorf("write push request: %w", err)
-	}
-	push, err := c.readPushReply(ctx)
-	if err != nil {
-		return nil, err
-	}
-	c.push = push
-	c.data, err = NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID)
-	if err != nil {
-		return nil, err
-	}
-	// The server answered PUSH_REPLY, so it received everything we sent.
-	// Drop any packet still awaiting an ACK before the keeper takes over.
-	c.control.ClearPending()
-	c.startControlKeeper()
-	c.markSend()
-	c.markReceive()
-	return push, nil
+	return keys, nil
 }
 
-// ErrRenegotiationRequested is recorded when the server starts a key
-// renegotiation (P_CONTROL_SOFT_RESET_V1). Renegotiation is not implemented
-// yet, so the session is torn down cleanly and re-established on the next
-// dial instead of lingering until the server's hand-window kills it.
+// ErrRenegotiationRequested is used internally to unwind the TLS read path
+// when the server starts a key renegotiation (P_CONTROL_SOFT_RESET_V1); the
+// control keeper then performs the renegotiation.
 var ErrRenegotiationRequested = errors.New("openvpn server requested key renegotiation")
+
+// RenegotiationTimeout bounds one renegotiation attempt, mirroring the
+// reference implementation's --hand-window default.
+const RenegotiationTimeout = 60 * time.Second
+
+// notifyControlPacket observes non-TLS control packets on the transport.
+// A soft reset for a new key id aborts the current TLS read so the keeper
+// can renegotiate.
+func (c *Client) notifyControlPacket(packet *ControlPacket) error {
+	if packet.Opcode == PControlSoftResetV1 && packet.KeyID != c.control.CurrentKeyID() {
+		c.softResetKeyID.Store(uint32(packet.KeyID))
+		return ErrRenegotiationRequested
+	}
+	return nil
+}
+
+// renegotiate performs a server-initiated key renegotiation: it opens the
+// new key session (fresh reliable stream under the new key id), reruns the
+// TLS + key-method-2 exchange and swaps the data channel keys, keeping the
+// previous key as lame duck for in-flight packets.
+func (c *Client) renegotiate() error {
+	keyID := uint8(c.softResetKeyID.Load())
+	ctx, cancel := context.WithTimeout(c.runCtx, RenegotiationTimeout)
+	defer cancel()
+
+	c.control.StartKeySession(keyID)
+	// The server's soft reset is message 0 of the new stream: ACK it so
+	// the server proceeds with its TLS flight.
+	if err := c.control.SendAck(ctx); err != nil {
+		return fmt.Errorf("ack soft reset: %w", err)
+	}
+	keys, err := c.negotiateKeys(ctx)
+	if err != nil {
+		return err
+	}
+	push := c.push
+	if push == nil {
+		return errors.New("renegotiation before initial push reply")
+	}
+	newData, err := NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, keyID)
+	if err != nil {
+		return err
+	}
+	// Switch sending to the new key immediately; keep the old key for
+	// decrypting packets still in flight (lame duck).
+	c.dataOld.Store(c.data.Swap(newData))
+	c.markReceive()
+	return nil
+}
 
 // startControlKeeper keeps consuming the control channel after the
 // handshake. Without it the packet mux control queue fills up and stalls
 // the data channel, and server messages (AUTH_FAILED on token expiry,
 // RESTART, HALT, soft resets) go unnoticed.
 func (c *Client) startControlKeeper() {
-	c.controlConn.SetNotify(func(packet *ControlPacket) error {
-		if packet.Opcode == PControlSoftResetV1 {
-			return ErrRenegotiationRequested
-		}
-		return nil
-	})
 	go func() {
 		for c.runCtx.Err() == nil {
 			msg, err := c.readControlMessage(c.runCtx)
 			if err != nil {
+				if errors.Is(err, ErrRenegotiationRequested) {
+					if renegErr := c.renegotiate(); renegErr != nil {
+						if c.runCtx.Err() == nil {
+							c.failSession(fmt.Errorf("openvpn key renegotiation: %w", renegErr))
+						}
+						return
+					}
+					continue
+				}
 				if c.runCtx.Err() == nil && !errors.Is(err, net.ErrClosed) {
 					c.failSession(err)
 				}
@@ -225,7 +324,7 @@ func (c *Client) WritePing(ctx context.Context) error {
 }
 
 func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
-	if c.data == nil {
+	if c.data.Load() == nil {
 		return errors.New("openvpn data channel is not ready")
 	}
 	if err := c.writeSem.Acquire(ctx, 1); err != nil {
@@ -239,7 +338,9 @@ func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
 		}
 		packet = compressed
 	}
-	encrypted, err := c.data.Encrypt(packet)
+	// Load under the semaphore so a renegotiation swap is picked up by the
+	// next packet.
+	encrypted, err := c.data.Load().Encrypt(packet)
 	if err != nil {
 		return err
 	}
@@ -256,7 +357,7 @@ func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
 var ErrRemoteExit = errors.New("openvpn peer sent exit notify")
 
 func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
-	if c.data == nil {
+	if c.data.Load() == nil {
 		return nil, errors.New("openvpn data channel is not ready")
 	}
 	for {
@@ -264,7 +365,11 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		plain, err := c.data.Decrypt(packet)
+		data := c.dataForPacket(packet)
+		if data == nil {
+			continue
+		}
+		plain, err := data.Decrypt(packet)
 		if err != nil {
 			continue
 		}
@@ -293,6 +398,23 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// dataForPacket routes an incoming data packet to the key session matching
+// the key id in its header: the active key, or the lame duck one during a
+// renegotiation overlap.
+func (c *Client) dataForPacket(packet []byte) *DataChannel {
+	if len(packet) == 0 {
+		return nil
+	}
+	_, keyID := parseOpcodeKeyID(packet[0])
+	if data := c.data.Load(); data != nil && data.KeyID() == keyID {
+		return data
+	}
+	if old := c.dataOld.Load(); old != nil && old.KeyID() == keyID {
+		return old
+	}
+	return nil
+}
+
 func (c *Client) handleOCC(ctx context.Context, packet []byte) error {
 	switch occOpcode(packet) {
 	case OCCExit:
@@ -309,7 +431,7 @@ func (c *Client) handleOCC(ctx context.Context, packet []byte) error {
 // going away so it can drop the session immediately instead of keeping it
 // alive until its keepalive timeout. Only meaningful over UDP.
 func (c *Client) SendExitNotify(ctx context.Context) error {
-	if c.data == nil || c.config.Proto != ProtoUDP {
+	if c.data.Load() == nil || c.config.Proto != ProtoUDP {
 		return nil
 	}
 	packet := buildOCCPacket(OCCExit, nil)
@@ -350,8 +472,11 @@ func (c *Client) Close() error {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	if c.tlsConn != nil {
-		_ = c.tlsConn.Close()
+	c.connMu.Lock()
+	tlsConn := c.tlsConn
+	c.connMu.Unlock()
+	if tlsConn != nil {
+		_ = tlsConn.Close()
 	}
 	if c.mux != nil {
 		return c.mux.Close()

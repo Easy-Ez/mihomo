@@ -21,11 +21,11 @@ func TestDataChannelAESGCMV2RoundTrip(t *testing.T) {
 		RecvCipherKey: clientKeys.SendCipherKey,
 		RecvHMACKey:   clientKeys.SendHMACKey,
 	}
-	client, err := NewDataChannel(clientKeys, CipherAES128GCM, AuthSHA256, 7)
+	client, err := NewDataChannel(clientKeys, CipherAES128GCM, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewDataChannel(serverKeys, CipherAES128GCM, AuthSHA256, 7)
+	server, err := NewDataChannel(serverKeys, CipherAES128GCM, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +75,11 @@ func TestDataChannelAcceptsOutOfOrderPacketsWithinReplayWindow(t *testing.T) {
 		RecvCipherKey: clientKeys.SendCipherKey,
 		RecvHMACKey:   clientKeys.SendHMACKey,
 	}
-	client, err := NewDataChannel(clientKeys, CipherAES128GCM, AuthSHA256, 7)
+	client, err := NewDataChannel(clientKeys, CipherAES128GCM, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewDataChannel(serverKeys, CipherAES128GCM, AuthSHA256, 7)
+	server, err := NewDataChannel(serverKeys, CipherAES128GCM, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestDataChannelPacketIDExhaustion(t *testing.T) {
 		RecvCipherKey: bytes.Repeat([]byte{0x33}, 16),
 		RecvHMACKey:   bytes.Repeat([]byte{0x44}, maxHMACKeyLength),
 	}
-	channel, err := NewDataChannel(keys, CipherAES128GCM, AuthSHA256, 7)
+	channel, err := NewDataChannel(keys, CipherAES128GCM, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +130,49 @@ func TestDataChannelPacketIDExhaustion(t *testing.T) {
 	// The final packet id would wrap the counter and reuse an AEAD nonce.
 	if _, err := channel.Encrypt([]byte{0x45}); err == nil {
 		t.Fatal("expected packet id exhaustion error")
+	}
+}
+
+func TestClientRoutesDataPacketsByKeyID(t *testing.T) {
+	keys := &KeyMaterial{
+		SendCipherKey: bytes.Repeat([]byte{0x11}, 16),
+		SendHMACKey:   bytes.Repeat([]byte{0x22}, maxHMACKeyLength),
+		RecvCipherKey: bytes.Repeat([]byte{0x33}, 16),
+		RecvHMACKey:   bytes.Repeat([]byte{0x44}, maxHMACKeyLength),
+	}
+	oldChannel, err := NewDataChannel(keys, CipherAES128GCM, AuthSHA256, 7, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newChannel, err := NewDataChannel(keys, CipherAES128GCM, AuthSHA256, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{}
+	client.data.Store(newChannel)
+	client.dataOld.Store(oldChannel)
+
+	if got := client.dataForPacket([]byte{opcodeKeyID(PDataV2, 1), 0, 0, 7}); got != newChannel {
+		t.Fatal("key id 1 must route to the active channel")
+	}
+	if got := client.dataForPacket([]byte{opcodeKeyID(PDataV2, 0), 0, 0, 7}); got != oldChannel {
+		t.Fatal("key id 0 must route to the lame duck channel")
+	}
+	if got := client.dataForPacket([]byte{opcodeKeyID(PDataV2, 5), 0, 0, 7}); got != nil {
+		t.Fatal("unknown key id must not match any channel")
+	}
+
+	// The header of an encrypted packet carries the channel's key id, so
+	// the peer can route it the same way.
+	encrypted, err := newChannel.Encrypt([]byte{0x45})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, keyID := parseOpcodeKeyID(encrypted[0]); keyID != 1 {
+		t.Fatalf("unexpected key id in header: %d", keyID)
+	}
+	if newChannel.KeyID() != 1 || oldChannel.KeyID() != 0 {
+		t.Fatalf("unexpected channel key ids: %d/%d", newChannel.KeyID(), oldChannel.KeyID())
 	}
 }
 
@@ -175,11 +218,11 @@ func TestDataChannelChaCha20Poly1305V2RoundTrip(t *testing.T) {
 		RecvCipherKey: clientKeys.SendCipherKey,
 		RecvHMACKey:   clientKeys.SendHMACKey,
 	}
-	client, err := NewDataChannel(clientKeys, CipherChaCha20Poly1305, AuthSHA256, 7)
+	client, err := NewDataChannel(clientKeys, CipherChaCha20Poly1305, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewDataChannel(serverKeys, CipherChaCha20Poly1305, AuthSHA256, 7)
+	server, err := NewDataChannel(serverKeys, CipherChaCha20Poly1305, AuthSHA256, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,11 +258,11 @@ func TestDataChannelAESCBCSHA1V2RoundTrip(t *testing.T) {
 		RecvCipherKey: clientKeys.SendCipherKey,
 		RecvHMACKey:   clientKeys.SendHMACKey,
 	}
-	client, err := NewDataChannel(clientKeys, CipherAES128CBC, AuthSHA1, 7)
+	client, err := NewDataChannel(clientKeys, CipherAES128CBC, AuthSHA1, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewDataChannel(serverKeys, CipherAES128CBC, AuthSHA1, 7)
+	server, err := NewDataChannel(serverKeys, CipherAES128CBC, AuthSHA1, 7, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

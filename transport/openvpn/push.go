@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/netip"
 	"strconv"
@@ -32,6 +33,12 @@ type PushReply struct {
 	BlockIPv6   bool
 	Ping        time.Duration
 	PingRestart time.Duration
+
+	// AuthToken (and the optional AuthTokenUser it comes with) replaces
+	// the password (and username) on later renegotiations when the server
+	// runs --auth-gen-token.
+	AuthToken     string
+	AuthTokenUser string
 }
 
 func ParsePushReply(message string) (*PushReply, error) {
@@ -121,6 +128,16 @@ func ParsePushReplyMessages(messages []string) (*PushReply, error) {
 			if len(fields) >= 2 {
 				if seconds, err := strconv.Atoi(fields[1]); err == nil && seconds > 0 {
 					reply.PingRestart = time.Duration(seconds) * time.Second
+				}
+			}
+		case "auth-token":
+			if len(fields) >= 2 {
+				reply.AuthToken = fields[1]
+			}
+		case "auth-token-user":
+			if len(fields) >= 2 {
+				if decoded, err := base64.StdEncoding.DecodeString(fields[1]); err == nil {
+					reply.AuthTokenUser = string(decoded)
 				}
 			}
 		}
