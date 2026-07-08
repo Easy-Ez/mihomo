@@ -97,6 +97,29 @@ func (c *ControlChannel) SetRemoteSessionID(id SessionID) {
 	c.mu.Unlock()
 }
 
+func (c *ControlChannel) CurrentKeyID() uint8 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.keyID
+}
+
+// StartKeySession switches the channel to a new key id after a soft reset:
+// the reliable stream restarts from message id 0 on both sides while the
+// session ids and the tls-crypt packet-id counter carry over, mirroring how
+// the reference implementation opens a new key_state inside the running
+// tls_session. The server's soft reset is message 0 of the new stream and
+// is scheduled for acknowledgement here.
+func (c *ControlChannel) StartKeySession(keyID uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.keyID = keyID
+	c.sendMessage = 0
+	c.recvMessage = 1
+	c.ackPending = []uint32{0}
+	c.pending = make(map[uint32]*pendingControl)
+	c.recvPending = make(map[uint32]*ControlPacket)
+}
+
 func (c *ControlChannel) SendReset(ctx context.Context) error {
 	_, err := c.Send(ctx, PControlHardResetClientV2, nil)
 	return err
@@ -196,15 +219,25 @@ func (c *ControlChannel) Read(ctx context.Context) (*ControlPacket, error) {
 		if c.remote == (SessionID{}) && packet.LocalSession != c.local {
 			c.remote = packet.LocalSession
 		}
-		for _, ackID := range packet.AckIDs {
-			delete(c.pending, ackID)
-		}
-		if packet.Opcode == PControlSoftResetV1 {
-			// A soft reset opens a new key session: its message id lives in
-			// a fresh reliable-layer space, so it must not be merged into
-			// (or ACKed within) the current stream. Surface it directly.
+		if packet.Opcode == PControlSoftResetV1 && packet.KeyID != c.keyID {
+			// A soft reset for a different key id opens a new key session:
+			// its message id lives in a fresh reliable-layer space, so it
+			// must not be merged into (or ACKed within) the current stream.
+			// Surface it so the client can renegotiate. Retransmissions of
+			// the reset that opened the *current* session fall through and
+			// are re-ACKed as ordinary duplicates.
 			c.mu.Unlock()
 			return packet, nil
+		}
+		if packet.KeyID != c.keyID {
+			// Stale traffic from a previous (lame duck) key session, e.g. a
+			// late retransmission: it is not part of the current stream and
+			// its ACKs reference foreign message ids.
+			c.mu.Unlock()
+			continue
+		}
+		for _, ackID := range packet.AckIDs {
+			delete(c.pending, ackID)
 		}
 		if packet.Opcode.HasMessageID() {
 			c.ackPending = appendAck(c.ackPending, packet.MessageID)

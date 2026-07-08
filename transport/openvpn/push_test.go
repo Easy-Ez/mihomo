@@ -50,6 +50,19 @@ func TestPushReplyContinuation(t *testing.T) {
 	}
 }
 
+func TestParsePushReplyAuthToken(t *testing.T) {
+	reply, err := ParsePushReply("PUSH_REPLY,auth-token SESS_ID_abc123,auth-token-user dXNlcjE=,ifconfig 10.8.0.2 255.255.255.0\x00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.AuthToken != "SESS_ID_abc123" {
+		t.Fatalf("unexpected auth token: %q", reply.AuthToken)
+	}
+	if reply.AuthTokenUser != "user1" {
+		t.Fatalf("unexpected auth token user: %q", reply.AuthTokenUser)
+	}
+}
+
 func TestParsePushReplyMessagesRejectsNonPush(t *testing.T) {
 	if _, err := ParsePushReplyMessages([]string{"AUTH_FAILED"}); err == nil {
 		t.Fatal("expected error for non-push message")

@@ -72,7 +72,10 @@ type DataChannel struct {
 	randOffset int
 }
 
-func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint32) (*DataChannel, error) {
+// NewDataChannel builds the cipher state for one key session; keyID tags
+// every data packet header so the peer (and our receive path) can route
+// packets to the right key during renegotiation overlap.
+func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint32, keyID uint8) (*DataChannel, error) {
 	if keys == nil {
 		return nil, errors.New("nil openvpn key material")
 	}
@@ -91,8 +94,9 @@ func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint3
 		d := &DataChannel{
 			sendAEAD: send,
 			recvAEAD: recv,
+			keyID:    keyID,
 			peerID:   peerID,
-			header:   dataHeader(peerID, 0),
+			header:   dataHeader(peerID, keyID),
 		}
 		copy(d.sendImplicitIV[4:], keys.SendHMACKey[:DataChannelIVSize-4])
 		copy(d.recvImplicitIV[4:], keys.RecvHMACKey[:DataChannelIVSize-4])
@@ -121,8 +125,9 @@ func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint3
 		recvHMACKey: append([]byte(nil), keys.RecvHMACKey[:authSize]...),
 		authHash:    authHash,
 		authSize:    authSize,
+		keyID:       keyID,
 		peerID:      peerID,
-		header:      dataHeader(peerID, 0),
+		header:      dataHeader(peerID, keyID),
 	}
 	d.sendMACPool.New = func() any {
 		return hmac.New(d.authHash, d.sendHMACKey)
@@ -322,6 +327,11 @@ func (d *DataChannel) decryptCBC(packet []byte, headerSize int) ([]byte, error) 
 		return nil, err
 	}
 	return plain[4:], nil
+}
+
+// KeyID reports which key session this channel encrypts/decrypts for.
+func (d *DataChannel) KeyID() uint8 {
+	return d.keyID
 }
 
 func dataPacketHeaderSize(packet []byte) (int, error) {

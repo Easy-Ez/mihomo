@@ -563,6 +563,160 @@ func TestControlConnNotifyAbortsOnSoftReset(t *testing.T) {
 	}
 }
 
+func TestStartKeySessionResetsReliableStream(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+
+	ctx := context.Background()
+	// Advance the key-0 stream a bit.
+	for i := 0; i < 3; i++ {
+		if _, err := control.Send(ctx, PControlV1, []byte("old")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := serverIO.ReadPacket(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	control.StartKeySession(1)
+	if control.CurrentKeyID() != 1 {
+		t.Fatalf("unexpected key id %d", control.CurrentKeyID())
+	}
+	if control.PendingMessages() != 0 {
+		t.Fatalf("pending not cleared: %d", control.PendingMessages())
+	}
+	// The soft reset (message 0 of the new stream) must be ACKed under the
+	// new key id.
+	if err := control.SendAck(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := serverIO.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _, _, err := DecodeControlPacket(nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Opcode != PAckV1 || packet.KeyID != 1 || len(packet.AckIDs) != 1 || packet.AckIDs[0] != 0 {
+		t.Fatalf("unexpected soft reset ack: %s key=%d acks=%v", packet.Opcode, packet.KeyID, packet.AckIDs)
+	}
+	// The first message of the new session starts from id 0 again.
+	if _, err := control.Send(ctx, PControlV1, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = serverIO.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _, _, err = DecodeControlPacket(nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.KeyID != 1 || packet.MessageID != 0 {
+		t.Fatalf("unexpected first new-session packet: key=%d id=%d", packet.KeyID, packet.MessageID)
+	}
+}
+
+func TestControlChannelDropsStaleKeyPackets(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	var serverID SessionID
+	copy(serverID[:], []byte("server01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+	control.SetRemoteSessionID(serverID)
+
+	ctx := context.Background()
+	control.StartKeySession(1)
+	if err := control.SendAck(ctx); err != nil { // flush the soft reset ack
+		t.Fatal(err)
+	}
+	if _, err := serverIO.ReadPacket(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A late retransmission from the lame duck key-0 session must neither
+	// be delivered nor pollute the new session's ack backlog.
+	stale, err := (ControlPacket{
+		Opcode:       PControlV1,
+		KeyID:        0,
+		LocalSession: serverID,
+		MessageID:    9,
+		Payload:      []byte("stale"),
+	}).Encode(nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverIO.WritePacket(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := control.Read(readCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stale-key packet must not be delivered, got %v", err)
+	}
+	control.mu.Lock()
+	pendingAcks := len(control.ackPending)
+	control.mu.Unlock()
+	if pendingAcks != 0 {
+		t.Fatalf("stale packet polluted ack backlog: %d", pendingAcks)
+	}
+}
+
+func TestControlChannelReacksDuplicateSoftReset(t *testing.T) {
+	clientIO, serverIO := newMemoryPacketPair()
+	var clientID SessionID
+	copy(clientID[:], []byte("client01"))
+	var serverID SessionID
+	copy(serverID[:], []byte("server01"))
+	control := NewControlChannel(clientIO, nil, clientID)
+	control.SetRemoteSessionID(serverID)
+
+	ctx := context.Background()
+	control.StartKeySession(1)
+	if err := control.SendAck(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverIO.ReadPacket(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server retransmits the soft reset that opened the current
+	// session (our ACK was lost): it must be re-ACKed as a duplicate, not
+	// surfaced as a new renegotiation request.
+	reset, err := (ControlPacket{
+		Opcode:       PControlSoftResetV1,
+		KeyID:        1,
+		LocalSession: serverID,
+		MessageID:    0,
+	}).Encode(nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverIO.WritePacket(ctx, reset); err != nil {
+		t.Fatal(err)
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	if _, err := control.Read(readCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("duplicate soft reset must not be delivered, got %v", err)
+	}
+	raw, err := serverIO.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _, _, err := DecodeControlPacket(nil, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Opcode != PAckV1 || packet.KeyID != 1 || len(packet.AckIDs) != 1 || packet.AckIDs[0] != 0 {
+		t.Fatalf("expected duplicate re-ack, got %s key=%d acks=%v", packet.Opcode, packet.KeyID, packet.AckIDs)
+	}
+}
+
 func TestTCPPacketIOFraming(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
