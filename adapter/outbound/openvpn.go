@@ -41,26 +41,32 @@ type OpenVPN struct {
 
 type OpenVPNOption struct {
 	BasicOption
-	Name             string            `proxy:"name"`
-	Server           string            `proxy:"server"`
-	Port             int               `proxy:"port"`
-	Proto            string            `proxy:"proto,omitempty"`
-	Dev              string            `proxy:"dev,omitempty"`
-	Cipher           string            `proxy:"cipher,omitempty"`
-	Auth             string            `proxy:"auth,omitempty"`
-	CompLZO          string            `proxy:"comp-lzo,omitempty"`
-	CA               string            `proxy:"ca"`
-	Cert             string            `proxy:"cert,omitempty"`
-	Key              string            `proxy:"key,omitempty"`
-	TLSCrypt         string            `proxy:"tls-crypt,omitempty"`
-	Username         string            `proxy:"username,omitempty"`
-	Password         string            `proxy:"password,omitempty"`
-	PeerInfo         map[string]string `proxy:"peer-info,omitempty"`
-	Ping             int               `proxy:"ping,omitempty"`
-	PingRestart      int               `proxy:"ping-restart,omitempty"`
-	HandshakeTimeout int               `proxy:"handshake-timeout,omitempty"`
-	MTU              int               `proxy:"mtu,omitempty"`
-	UDP              bool              `proxy:"udp,omitempty"`
+	Name               string            `proxy:"name"`
+	Server             string            `proxy:"server"`
+	Port               int               `proxy:"port"`
+	Proto              string            `proxy:"proto,omitempty"`
+	Dev                string            `proxy:"dev,omitempty"`
+	Cipher             string            `proxy:"cipher,omitempty"`
+	Auth               string            `proxy:"auth,omitempty"`
+	CompLZO            string            `proxy:"comp-lzo,omitempty"`
+	Compress           string            `proxy:"compress,omitempty"`
+	CA                 string            `proxy:"ca"`
+	Cert               string            `proxy:"cert,omitempty"`
+	Key                string            `proxy:"key,omitempty"`
+	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
+	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
+	TLSAuth            string            `proxy:"tls-auth,omitempty"`
+	KeyDirection       int               `proxy:"key-direction,omitempty"`
+	VerifyX509Name     string            `proxy:"verify-x509-name,omitempty"`
+	VerifyX509NameType string            `proxy:"verify-x509-name-type,omitempty"`
+	Username           string            `proxy:"username,omitempty"`
+	Password           string            `proxy:"password,omitempty"`
+	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
+	Ping               int               `proxy:"ping,omitempty"`
+	PingRestart        int               `proxy:"ping-restart,omitempty"`
+	HandshakeTimeout   int               `proxy:"handshake-timeout,omitempty"`
+	MTU                int               `proxy:"mtu,omitempty"`
+	UDP                bool              `proxy:"udp,omitempty"`
 
 	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
 	Dns              []string `proxy:"dns,omitempty"`
@@ -71,22 +77,35 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
 		return nil, errors.New("openvpn handshake timeout must be non-negative")
 	}
 	cfg := &ovpn.ClientConfig{
-		RemoteHost:   option.Server,
-		RemotePort:   uint16(option.Port),
-		Proto:        option.Proto,
-		Dev:          option.Dev,
-		Cipher:       option.Cipher,
-		Auth:         option.Auth,
-		CompLZO:      option.CompLZO,
-		CA:           []byte(option.CA),
-		Cert:         []byte(option.Cert),
-		Key:          []byte(option.Key),
-		TLSCrypt:     []byte(option.TLSCrypt),
-		Username:     option.Username,
-		Password:     option.Password,
-		PeerInfo:     option.PeerInfo,
-		PingInterval: time.Duration(option.Ping) * time.Second,
-		PingRestart:  time.Duration(option.PingRestart) * time.Second,
+		RemoteHost: option.Server,
+		RemotePort: uint16(option.Port),
+		Proto:      option.Proto,
+		Dev:        option.Dev,
+		Cipher:     option.Cipher,
+		Auth:       option.Auth,
+		CompLZO:    option.CompLZO,
+		Compress:   option.Compress,
+		CA:         []byte(option.CA),
+		Cert:       []byte(option.Cert),
+		Key:        []byte(option.Key),
+		TLSCrypt:   []byte(option.TLSCrypt),
+		TLSCryptV2: []byte(option.TLSCryptV2),
+		TLSAuth:    []byte(option.TLSAuth),
+		// A client's tls-auth uses key-direction 1 by convention; treat the
+		// zero value (unset) as that default. Use -1 for a bidirectional key.
+		KeyDirection:       option.KeyDirection,
+		VerifyX509Name:     option.VerifyX509Name,
+		VerifyX509NameType: option.VerifyX509NameType,
+		Username:           option.Username,
+		Password:           option.Password,
+		PeerInfo:           option.PeerInfo,
+		PingInterval:       time.Duration(option.Ping) * time.Second,
+		PingRestart:        time.Duration(option.PingRestart) * time.Second,
+	}
+	// tls-auth on a client conventionally uses key-direction 1; the option's
+	// zero value means "unset", so default it here (use -1 for bidirectional).
+	if len(option.TLSAuth) > 0 && option.KeyDirection == 0 {
+		cfg.KeyDirection = ovpn.KeyDirectionClient
 	}
 	if err := cfg.Prepare(); err != nil {
 		return nil, err

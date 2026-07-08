@@ -89,6 +89,31 @@ func TestClientConfigRejectsUnsupportedProto(t *testing.T) {
 	}
 }
 
+func TestClientConfigTLSAuth(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.TLSCrypt = nil
+	cfg.TLSAuth = []byte(testTLSCryptBlock())
+	cfg.KeyDirection = KeyDirectionClient
+	if err := cfg.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TLSAuthKey) != 256 {
+		t.Fatalf("unexpected tls-auth key length: %d", len(cfg.TLSAuthKey))
+	}
+	// The decoded key must build a working TLSAuth wrapper.
+	if _, err := NewTLSAuth(cfg.TLSAuthKey, cfg.Auth, cfg.KeyDirection); err != nil {
+		t.Fatalf("NewTLSAuth: %v", err)
+	}
+}
+
+func TestClientConfigRejectsTLSCryptAndTLSAuth(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.TLSAuth = []byte(testTLSCryptBlock())
+	if err := cfg.Prepare(); err == nil || !strings.Contains(err.Error(), "only one of tls-crypt") {
+		t.Fatalf("expected mutual-exclusion error, got %v", err)
+	}
+}
+
 func TestClientConfigAllowsMissingTLSCrypt(t *testing.T) {
 	cfg := yamlStyleConfig()
 	cfg.TLSCrypt = nil

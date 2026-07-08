@@ -34,6 +34,12 @@ type PushReply struct {
 	Ping        time.Duration
 	PingRestart time.Duration
 
+	// Cipher is the data cipher the server selected via NCP, if any.
+	Cipher string
+
+	// Unknown holds pushed options we parsed but do not act on, for logging.
+	Unknown []string
+
 	// AuthToken (and the optional AuthTokenUser it comes with) replaces
 	// the password (and username) on later renegotiations when the server
 	// runs --auth-gen-token.
@@ -130,6 +136,10 @@ func ParsePushReplyMessages(messages []string) (*PushReply, error) {
 					reply.PingRestart = time.Duration(seconds) * time.Second
 				}
 			}
+		case "cipher":
+			if len(fields) >= 2 {
+				reply.Cipher = fields[1]
+			}
 		case "auth-token":
 			if len(fields) >= 2 {
 				reply.AuthToken = fields[1]
@@ -140,6 +150,12 @@ func ParsePushReplyMessages(messages []string) (*PushReply, error) {
 					reply.AuthTokenUser = string(decoded)
 				}
 			}
+		case "push-continuation":
+			// Handled by pushReplyContinuation; not a routing option.
+		default:
+			// Record options we do not act on so the connection log can
+			// surface anything a server relies on that we ignore.
+			reply.Unknown = append(reply.Unknown, option)
 		}
 	}
 	if len(reply.Prefixes) == 0 {

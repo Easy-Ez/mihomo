@@ -9,8 +9,8 @@ import (
 
 func TestKeyMethod2ClientMarshalAndDerive(t *testing.T) {
 	record := &KeyMethod2Record{
-		Options:  InstallScriptOptionsString(ProtoUDP, CipherAES128GCM, AuthSHA256, ""),
-		PeerInfo: InstallScriptPeerInfo(CipherAES128GCM, "", nil),
+		Options:  installScriptOptionsString(ProtoUDP, CipherAES128GCM, AuthSHA256, compressNone),
+		PeerInfo: installScriptPeerInfo(CipherAES128GCM, compressNone, nil),
 	}
 	for i := range record.Sources.Client.PreMaster {
 		record.Sources.Client.PreMaster[i] = byte(i + 1)
@@ -53,8 +53,8 @@ func TestKeyMethod2ClientMarshalAndDerive(t *testing.T) {
 
 func TestKeyMethod2DeriveAES256(t *testing.T) {
 	record := &KeyMethod2Record{
-		Options:  InstallScriptOptionsString(ProtoUDP, CipherAES256GCM, AuthSHA256, ""),
-		PeerInfo: InstallScriptPeerInfo(CipherAES256GCM, "", nil),
+		Options:  installScriptOptionsString(ProtoUDP, CipherAES256GCM, AuthSHA256, compressNone),
+		PeerInfo: installScriptPeerInfo(CipherAES256GCM, compressNone, nil),
 	}
 	for i := range record.Sources.Client.PreMaster {
 		record.Sources.Client.PreMaster[i] = byte(i + 1)
@@ -84,7 +84,7 @@ func TestKeyMethod2DeriveAES256(t *testing.T) {
 }
 
 func TestInstallScriptOptionsCBCSHA1(t *testing.T) {
-	options := InstallScriptOptionsString(ProtoTCP, CipherAES256CBC, AuthSHA1, "")
+	options := installScriptOptionsString(ProtoTCP, CipherAES256CBC, AuthSHA1, compressNone)
 	for _, want := range []string{"proto TCPv4_CLIENT", "cipher AES-256-CBC", "auth SHA1", "keysize 256"} {
 		if !bytes.Contains([]byte(options), []byte(want)) {
 			t.Fatalf("options missing %q: %s", want, options)
@@ -92,21 +92,31 @@ func TestInstallScriptOptionsCBCSHA1(t *testing.T) {
 	}
 }
 
-func TestInstallScriptPeerInfo(t *testing.T) {
-	// Without user-defined peer-info the output is unchanged (backward compatible).
-	base := InstallScriptPeerInfo(CipherAES128GCM, "", nil)
-	if base != "IV_VER=mihomo-openvpn\nIV_PROTO=6\nIV_CIPHERS=AES-128-GCM\n" {
+func TestinstallScriptPeerInfo(t *testing.T) {
+	// The configured cipher is advertised first, followed by the other AEAD
+	// ciphers so the server can pick one via NCP.
+	base := installScriptPeerInfo(CipherAES128GCM, compressNone, nil)
+	if base != "IV_VER=mihomo-openvpn\nIV_PROTO=6\nIV_CIPHERS=AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305\n" {
 		t.Fatalf("unexpected default peer-info: %q", base)
 	}
 
 	// User-defined entries are appended after the built-in fields, sorted by key.
-	info := InstallScriptPeerInfo(CipherAES128GCM, "", map[string]string{
+	info := installScriptPeerInfo(CipherAES128GCM, compressNone, map[string]string{
 		"UV_DEVICE_ID": "laptop-001",
 		"IV_HWADDR":    "52:54:00:ff:72:87",
 	})
 	want := base + "IV_HWADDR=52:54:00:ff:72:87\nUV_DEVICE_ID=laptop-001\n"
 	if info != want {
 		t.Fatalf("unexpected peer-info:\n got %q\nwant %q", info, want)
+	}
+}
+
+func TestDataCiphersListPutsConfiguredFirst(t *testing.T) {
+	if got := dataCiphersList(CipherAES256GCM); got != "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305" {
+		t.Fatalf("unexpected cipher list: %q", got)
+	}
+	if got := dataCiphersList(CipherChaCha20Poly1305); got != "CHACHA20-POLY1305:AES-256-GCM:AES-128-GCM" {
+		t.Fatalf("unexpected cipher list: %q", got)
 	}
 }
 

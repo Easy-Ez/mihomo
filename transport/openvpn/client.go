@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/log"
+
 	"github.com/metacubex/tls"
 	"golang.org/x/sync/semaphore"
 )
@@ -46,6 +48,14 @@ type Client struct {
 	sessionErr atomic.Pointer[error]
 	runCtx     context.Context
 
+	// cipher is the data cipher in effect: the configured one, or the one
+	// the server selected via NCP and pushed back.
+	cipher string
+	// serverAuth is the HMAC digest the server declared in its OCC options.
+	// --auth is not negotiated, so for a CBC data channel both ends must
+	// agree; the server's value is authoritative and overrides our default.
+	serverAuth string
+
 	// optionsString is the OCC options string sent in the key method 2
 	// record; it is also echoed in OCC_REPLY when the server probes us.
 	optionsString string
@@ -68,13 +78,31 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	if io == nil {
 		return nil, errors.New("nil openvpn packet io")
 	}
-	var crypt *TLSCrypt
-	if len(config.TLSCryptKey) > 0 {
-		var err error
-		crypt, err = NewTLSCrypt(config.TLSCryptKey, true)
+	var wrapper ControlWrapper
+	switch {
+	case len(config.TLSCryptV2Kc) > 0:
+		crypt, err := NewTLSCrypt(config.TLSCryptV2Kc, true)
 		if err != nil {
 			return nil, err
 		}
+		wrapper = crypt
+		log.Debugln("[OpenVPN] control channel protection: tls-crypt-v2")
+	case len(config.TLSCryptKey) > 0:
+		crypt, err := NewTLSCrypt(config.TLSCryptKey, true)
+		if err != nil {
+			return nil, err
+		}
+		wrapper = crypt
+		log.Debugln("[OpenVPN] control channel protection: tls-crypt")
+	case len(config.TLSAuthKey) > 0:
+		auth, err := NewTLSAuth(config.TLSAuthKey, config.Auth, config.KeyDirection)
+		if err != nil {
+			return nil, err
+		}
+		wrapper = auth
+		log.Debugln("[OpenVPN] control channel protection: tls-auth (auth=%s, key-direction=%d)", config.Auth, config.KeyDirection)
+	default:
+		log.Debugln("[OpenVPN] control channel protection: none (plaintext)")
 	}
 	local, err := NewSessionID()
 	if err != nil {
@@ -86,10 +114,14 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	client := &Client{
 		config:   config,
 		mux:      mux,
-		control:  NewControlChannel(mux, crypt, local),
+		control:  NewControlChannel(mux, wrapper, local),
 		cancel:   cancel,
 		runCtx:   runCtx,
 		writeSem: semaphore.NewWeighted(1),
+	}
+	if len(config.TLSCryptV2WKc) > 0 {
+		// Must be set before the retransmitter or the first reset is sent.
+		client.control.SetTLSCryptV2WKc(config.TLSCryptV2WKc)
 	}
 	go client.control.RunRetransmitter(runCtx)
 	client.markSend()
@@ -108,7 +140,7 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 
-	keys, err := c.negotiateKeys(ctx)
+	sources, err := c.negotiateKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -121,11 +153,25 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 	c.push = push
-	data, err := NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, c.control.CurrentKeyID())
+	cipher, err := c.negotiateCipher(push)
+	if err != nil {
+		return nil, err
+	}
+	c.cipher = cipher
+	data, err := c.buildDataChannel(sources, cipher, c.control.CurrentKeyID(), push.PeerID)
 	if err != nil {
 		return nil, err
 	}
 	c.data.Store(data)
+	dataMode := "AEAD"
+	if !isDataChannelAEAD(cipher) {
+		dataMode = "CBC+" + c.effectiveAuth(cipher)
+	}
+	log.Infoln("[OpenVPN] data channel ready: cipher=%s mode=%s peer-id=%d key-id=%d", cipher, dataMode, push.PeerID, c.control.CurrentKeyID())
+	log.Infoln("[OpenVPN] PUSH_REPLY: %s", push.Raw)
+	if len(push.Unknown) > 0 {
+		log.Warnln("[OpenVPN] unsupported pushed options (ignored): %s", strings.Join(push.Unknown, ", "))
+	}
 	// The server answered PUSH_REPLY, so it received everything we sent.
 	// Drop any packet still awaiting an ACK before the keeper takes over.
 	c.control.ClearPending()
@@ -136,11 +182,12 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 }
 
 // negotiateKeys runs a full TLS handshake plus key-method-2 exchange over
-// the control channel's current key session and derives the data channel
-// key material. It is used both for the initial handshake and for every
+// the control channel's current key session and returns the combined key
+// sources. It is used both for the initial handshake and for every
 // renegotiation (where the credentials may be replaced by a pushed
-// auth-token).
-func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
+// auth-token). Key material is derived later, once the data cipher is known
+// (it may be selected by the server via NCP).
+func (c *Client) negotiateKeys(ctx context.Context) (*KeySource2, error) {
 	tlsConfig, err := c.tlsConfig()
 	if err != nil {
 		return nil, err
@@ -160,9 +207,11 @@ func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("openvpn tls handshake: %w", err)
 	}
+	cs := tlsConn.ConnectionState()
+	log.Infoln("[OpenVPN] TLS established: version=0x%04x cipher-suite=%s", cs.Version, tls.CipherSuiteName(cs.CipherSuite))
 
 	if c.optionsString == "" {
-		c.optionsString = InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO)
+		c.optionsString = installScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.compressMode)
 	}
 	username := strings.TrimSpace(c.config.Username)
 	password := c.config.Password
@@ -176,7 +225,7 @@ func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
 	}
 	clientRecord, err := NewClientKeyMethod2Record(
 		c.optionsString,
-		InstallScriptPeerInfo(c.config.Cipher, c.config.CompLZO, c.config.PeerInfo),
+		installScriptPeerInfo(c.config.Cipher, c.config.compressMode, c.config.PeerInfo),
 		username,
 		password,
 	)
@@ -194,14 +243,90 @@ func (c *Client) negotiateKeys(ctx context.Context) (*KeyMaterial, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The server's OCC options string reveals the cipher/auth/comp/proto it
+	// was configured with — invaluable for diagnosing mismatches.
+	if serverRecord.Options != "" {
+		log.Infoln("[OpenVPN] server options: %s", serverRecord.Options)
+		c.adoptServerOptions(serverRecord.Options)
+	}
+	if serverRecord.PeerInfo != "" {
+		log.Debugln("[OpenVPN] server peer-info: %q", serverRecord.PeerInfo)
+	}
 
 	sources := clientRecord.Sources
 	sources.Server = serverRecord.Sources.Server
-	keys, err := DeriveClientKeyMaterial(sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), c.config.DataCipherKeyLength())
+	return &sources, nil
+}
+
+// adoptServerOptions inspects the server's OCC options string and records the
+// server-declared auth digest. Because --auth is not negotiated, a CBC data
+// channel must HMAC with the same digest as the server; the server's value is
+// authoritative and is later applied by effectiveAuth (AEAD ciphers ignore it).
+func (c *Client) adoptServerOptions(serverOptions string) {
+	opts := parseOCCOptions(serverOptions)
+	if serverCipher, ok := opts["cipher"]; ok && normalizeCipher(serverCipher) != c.config.Cipher {
+		log.Infoln("[OpenVPN] server cipher %q differs from configured %q (NCP push decides the final cipher)", serverCipher, c.config.Cipher)
+	}
+	if serverAuth, ok := opts["auth"]; ok {
+		if normalized := normalizeAuth(serverAuth); isSupportedAuth(normalized) {
+			c.serverAuth = normalized
+		}
+	}
+}
+
+// effectiveAuth returns the HMAC digest to use for the data channel. AEAD
+// ciphers do not use a separate HMAC, so the value is irrelevant there. For a
+// CBC cipher, the server's declared auth (if known) wins over the local
+// default, since --auth must match and is not negotiated.
+func (c *Client) effectiveAuth(cipher string) string {
+	if isDataChannelAEAD(cipher) {
+		return c.config.Auth
+	}
+	if c.serverAuth != "" {
+		return c.serverAuth
+	}
+	return c.config.Auth
+}
+
+// parseOCCOptions splits an OCC options string ("V4,dev-type tun,cipher X,
+// auth Y,...") into a key→value map keyed on the first token of each field.
+func parseOCCOptions(options string) map[string]string {
+	out := make(map[string]string)
+	for _, field := range strings.Split(options, ",") {
+		parts := strings.Fields(strings.TrimSpace(field))
+		if len(parts) >= 2 {
+			out[parts[0]] = strings.Join(parts[1:], " ")
+		}
+	}
+	return out
+}
+
+// negotiateCipher applies the data cipher the server selected through NCP
+// (pushed back as "cipher X"). It falls back to the configured cipher when
+// the server pushes nothing, and rejects a cipher this client cannot run.
+func (c *Client) negotiateCipher(push *PushReply) (string, error) {
+	if push == nil || push.Cipher == "" {
+		return c.config.Cipher, nil
+	}
+	negotiated := normalizeCipher(push.Cipher)
+	if !isSupportedCipher(negotiated) {
+		return "", fmt.Errorf("server negotiated unsupported data cipher %q", push.Cipher)
+	}
+	if negotiated != c.config.Cipher {
+		log.Infoln("[OpenVPN] server negotiated data cipher %s (configured %s)", negotiated, c.config.Cipher)
+	}
+	return negotiated, nil
+}
+
+// buildDataChannel derives key material for the given cipher and key id and
+// constructs the data channel. The cipher governs the key length, so this
+// must run after NCP has settled the cipher.
+func (c *Client) buildDataChannel(sources *KeySource2, cipher string, keyID uint8, peerID uint32) (*DataChannel, error) {
+	keys, err := DeriveClientKeyMaterial(*sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), cipherKeyLength(cipher))
 	if err != nil {
 		return nil, fmt.Errorf("derive data channel keys: %w", err)
 	}
-	return keys, nil
+	return NewDataChannel(keys, cipher, c.effectiveAuth(cipher), peerID, keyID)
 }
 
 // ErrRenegotiationRequested is used internally to unwind the TLS read path
@@ -233,21 +358,25 @@ func (c *Client) renegotiate() error {
 	ctx, cancel := context.WithTimeout(c.runCtx, RenegotiationTimeout)
 	defer cancel()
 
+	push := c.push
+	if push == nil {
+		return errors.New("renegotiation before initial push reply")
+	}
+	log.Debugln("[OpenVPN] key renegotiation started (new key-id %d)", keyID)
+
 	c.control.StartKeySession(keyID)
 	// The server's soft reset is message 0 of the new stream: ACK it so
 	// the server proceeds with its TLS flight.
 	if err := c.control.SendAck(ctx); err != nil {
 		return fmt.Errorf("ack soft reset: %w", err)
 	}
-	keys, err := c.negotiateKeys(ctx)
+	sources, err := c.negotiateKeys(ctx)
 	if err != nil {
 		return err
 	}
-	push := c.push
-	if push == nil {
-		return errors.New("renegotiation before initial push reply")
-	}
-	newData, err := NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, keyID)
+	// Reuse the cipher settled at the initial handshake; servers do not
+	// renegotiate the data cipher.
+	newData, err := c.buildDataChannel(sources, c.cipher, keyID, push.PeerID)
 	if err != nil {
 		return err
 	}
@@ -255,6 +384,7 @@ func (c *Client) renegotiate() error {
 	// decrypting packets still in flight (lame duck).
 	c.dataOld.Store(c.data.Swap(newData))
 	c.markReceive()
+	log.Debugln("[OpenVPN] key renegotiation complete (key-id %d)", keyID)
 	return nil
 }
 
@@ -291,9 +421,13 @@ func (c *Client) startControlKeeper() {
 			case strings.HasPrefix(msg, "RESTART"):
 				c.failSession(fmt.Errorf("openvpn server requested restart: %q", msg))
 				return
+			case strings.HasPrefix(msg, "INFO"):
+				log.Infoln("[OpenVPN] server INFO: %q", msg)
+			case strings.HasPrefix(msg, "PUSH_REPLY"):
+				log.Warnln("[OpenVPN] mid-session PUSH_REPLY update not applied: %q", msg)
 			default:
-				// INFO, PUSH_REPLY updates and unknown messages are
-				// acknowledged by the transport and ignored for now.
+				// Acknowledged by the transport; surface for diagnosis.
+				log.Debugln("[OpenVPN] unhandled control message: %q", msg)
 			}
 		}
 	}()
@@ -331,12 +465,8 @@ func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
 		return err
 	}
 	defer c.writeSem.Release(1)
-	if c.config.CompLZO == CompLzoYes {
-		compressed, err := lzo1xCompressSafe(packet)
-		if err != nil {
-			return err
-		}
-		packet = compressed
+	if c.config.compressMode != compressNone {
+		packet = compressFrame(c.config.compressMode, packet)
 	}
 	// Load under the semaphore so a renegotiation swap is picked up by the
 	// next packet.
@@ -376,8 +506,8 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 		c.markReceive()
 		// Compression framing wraps every data channel payload, so it must
 		// be stripped before recognizing ping and OCC messages.
-		if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
-			plain, err = lzo1xDecompressSafe(plain)
+		if c.config.compressMode != compressNone && len(plain) > 0 {
+			plain, err = decompressFrame(c.config.compressMode, plain)
 			if err != nil {
 				continue
 			}
@@ -494,6 +624,7 @@ func (c *Client) waitServerReset(ctx context.Context) error {
 		}
 		switch packet.Opcode {
 		case PControlHardResetServerV2:
+			log.Debugln("[OpenVPN] server hard reset received (key-id %d), sending ack", packet.KeyID)
 			return c.control.SendAck(ctx)
 		case PControlHardResetServerV1:
 			return fmt.Errorf("openvpn server replied with unsupported key method 1 reset")
@@ -608,9 +739,14 @@ func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
 			return nil, fmt.Errorf("openvpn server sent halt: %q", msg)
 		case strings.HasPrefix(msg, "RESTART"):
 			return nil, fmt.Errorf("openvpn server requested restart: %q", msg)
+		case strings.HasPrefix(msg, "AUTH_PENDING"):
+			// We do not yet extend the handshake for deferred/2FA auth; log
+			// it so a timeout here is attributable rather than mysterious.
+			log.Warnln("[OpenVPN] server sent AUTH_PENDING (deferred/2FA auth not yet supported): %q", msg)
+		case strings.HasPrefix(msg, "INFO"):
+			log.Infoln("[OpenVPN] server INFO: %q", msg)
 		default:
-			// AUTH_PENDING, INFO and other messages: keep waiting within
-			// the handshake deadline.
+			log.Warnln("[OpenVPN] unhandled control message during handshake: %q", msg)
 		}
 	}
 }
@@ -656,12 +792,20 @@ func (c *Client) tlsConfig() (*tls.Config, error) {
 		for _, cert := range cs.PeerCertificates[1:] {
 			intermediates.AddCert(cert)
 		}
-		_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+		if _, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
 			Roots:         roots,
 			Intermediates: intermediates,
 			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		})
-		return err
+		}); err != nil {
+			return err
+		}
+		// Like OpenVPN, the chain + ServerAuth EKU (remote-cert-tls server)
+		// is verified by default without matching the hostname; an explicit
+		// verify-x509-name additionally pins the server certificate subject.
+		if c.config.VerifyX509Name != "" {
+			return verifyX509Name(cs.PeerCertificates[0], c.config.VerifyX509Name, c.config.VerifyX509NameType)
+		}
+		return nil
 	}
 	cfg := &tls.Config{
 		InsecureSkipVerify: true,
@@ -677,6 +821,30 @@ func (c *Client) tlsConfig() (*tls.Config, error) {
 		cfg.Certificates = []tls.Certificate{cert}
 	}
 	return cfg, nil
+}
+
+// verifyX509Name enforces the --verify-x509-name directive against the
+// server leaf certificate. type "name" (default) requires the common name
+// to match exactly, "name-prefix" that it starts with name, and "subject"
+// that the whole subject DN matches.
+func verifyX509Name(cert *x509.Certificate, name, nameType string) error {
+	switch nameType {
+	case "", VerifyX509TypeName:
+		if cert.Subject.CommonName != name {
+			return fmt.Errorf("openvpn server certificate CN %q does not match verify-x509-name %q", cert.Subject.CommonName, name)
+		}
+	case VerifyX509TypeNamePrefix:
+		if !strings.HasPrefix(cert.Subject.CommonName, name) {
+			return fmt.Errorf("openvpn server certificate CN %q does not have required prefix %q", cert.Subject.CommonName, name)
+		}
+	case VerifyX509TypeSubject:
+		if cert.Subject.String() != name {
+			return fmt.Errorf("openvpn server certificate subject %q does not match verify-x509-name %q", cert.Subject.String(), name)
+		}
+	default:
+		return fmt.Errorf("unsupported verify-x509-name type %q", nameType)
+	}
+	return nil
 }
 
 var _ net.Conn = (*ControlConn)(nil)

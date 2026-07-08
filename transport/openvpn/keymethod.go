@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"sort"
+	"strings"
 )
 
 const (
@@ -171,7 +172,7 @@ func DeriveClientKeyMaterial(sources KeySource2, clientSession, serverSession Se
 	}, nil
 }
 
-func InstallScriptOptionsString(proto, cipher, auth string, compLZO string) string {
+func installScriptOptionsString(proto, cipher, auth string, mode compressionMode) string {
 	protoName := "UDPv4"
 	if proto == ProtoTCP {
 		protoName = "TCPv4_CLIENT"
@@ -182,19 +183,24 @@ func InstallScriptOptionsString(proto, cipher, auth string, compLZO string) stri
 	}
 	mtu := "1550"
 	comp := ""
-	if compLZO == CompLzoYes {
+	if mode == compressLZO {
 		mtu = "1544"
 		comp = "comp-lzo,"
 	}
 	return fmt.Sprintf("V4,dev-type tun,link-mtu %s,tun-mtu 1500,proto %s,%scipher %s,auth %s,keysize %s,key-method 2,tls-client", mtu, protoName, comp, cipher, auth, keysize)
 }
 
-func InstallScriptPeerInfo(cipher string, compLZO string, peerInfo map[string]string) string {
-	lzo := ""
-	if compLZO == CompLzoYes {
-		lzo = "IV_LZO=1\n"
+func installScriptPeerInfo(cipher string, mode compressionMode, peerInfo map[string]string) string {
+	comp := ""
+	switch mode {
+	case compressLZO:
+		comp = "IV_LZO=1\n"
+	case compressV1Stub:
+		comp = "IV_COMP_STUB=1\nIV_LZO_STUB=1\n"
+	case compressV2Stub:
+		comp = "IV_COMP_STUBv2=1\nIV_COMP_STUB=1\nIV_LZO_STUB=1\n"
 	}
-	info := fmt.Sprintf("IV_VER=mihomo-openvpn\nIV_PROTO=6\n%sIV_CIPHERS=%s\n", lzo, cipher)
+	info := fmt.Sprintf("IV_VER=mihomo-openvpn\nIV_PROTO=6\n%sIV_CIPHERS=%s\n", comp, dataCiphersList(cipher))
 	// Append user-defined peer-info entries (e.g. IV_HWADDR, UV_*) after the
 	// built-in fields. Keys are sorted so the output is deterministic.
 	keys := make([]string, 0, len(peerInfo))
@@ -206,6 +212,20 @@ func InstallScriptPeerInfo(cipher string, compLZO string, peerInfo map[string]st
 		info += fmt.Sprintf("%s=%s\n", key, peerInfo[key])
 	}
 	return info
+}
+
+// dataCiphersList builds the IV_CIPHERS advertisement: the configured
+// cipher first (so a server honoring order prefers it) followed by the
+// common AEAD ciphers this client can also run. Advertising several lets
+// the server pick via NCP; the choice is applied from the pushed "cipher".
+func dataCiphersList(cipher string) string {
+	ciphers := []string{cipher}
+	for _, candidate := range []string{CipherAES256GCM, CipherAES128GCM, CipherChaCha20Poly1305} {
+		if candidate != cipher {
+			ciphers = append(ciphers, candidate)
+		}
+	}
+	return strings.Join(ciphers, ":")
 }
 
 func appendOpenVPNString(out []byte, s string) []byte {

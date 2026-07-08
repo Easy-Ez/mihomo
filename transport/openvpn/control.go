@@ -52,12 +52,16 @@ type pendingControl struct {
 }
 
 type ControlChannel struct {
-	io     PacketIO
-	crypt  *TLSCrypt
-	clock  func() time.Time
-	keyID  uint8
-	local  SessionID
-	remote SessionID
+	io      PacketIO
+	wrapper ControlWrapper
+	clock   func() time.Time
+	keyID   uint8
+	local   SessionID
+	remote  SessionID
+
+	// wkc is the tls-crypt-v2 wrapped client key, appended unencrypted to
+	// the P_CONTROL_HARD_RESET_CLIENT_V3 packet; empty for other modes.
+	wkc []byte
 
 	mu            sync.Mutex
 	sendPacketID  uint32
@@ -70,10 +74,17 @@ type ControlChannel struct {
 	writeDeadline time.Time
 }
 
-func NewControlChannel(io PacketIO, crypt *TLSCrypt, local SessionID) *ControlChannel {
+// SetTLSCryptV2WKc enables tls-crypt-v2 mode: the client hard reset becomes a
+// P_CONTROL_HARD_RESET_CLIENT_V3 carrying the wrapped client key. Must be
+// called before the handshake starts.
+func (c *ControlChannel) SetTLSCryptV2WKc(wkc []byte) {
+	c.wkc = wkc
+}
+
+func NewControlChannel(io PacketIO, wrapper ControlWrapper, local SessionID) *ControlChannel {
 	return &ControlChannel{
 		io:          io,
-		crypt:       crypt,
+		wrapper:     wrapper,
 		clock:       time.Now,
 		local:       local,
 		pending:     make(map[uint32]*pendingControl),
@@ -121,7 +132,11 @@ func (c *ControlChannel) StartKeySession(keyID uint8) {
 }
 
 func (c *ControlChannel) SendReset(ctx context.Context) error {
-	_, err := c.Send(ctx, PControlHardResetClientV2, nil)
+	opcode := PControlHardResetClientV2
+	if len(c.wkc) > 0 {
+		opcode = PControlHardResetClientV3
+	}
+	_, err := c.Send(ctx, opcode, nil)
 	return err
 }
 
@@ -366,9 +381,15 @@ func (c *ControlChannel) writeControlPacket(ctx context.Context, packet *Control
 		defer cancel()
 	}
 
-	encoded, err := packet.Encode(c.crypt, packetID, unixTime)
+	encoded, err := packet.Encode(c.wrapper, packetID, unixTime)
 	if err != nil {
 		return err
+	}
+	// tls-crypt-v2: the wrapped client key rides unencrypted after the
+	// tls-crypt payload of the hard reset (and each of its retransmissions)
+	// so the server can recover Kc.
+	if packet.Opcode == PControlHardResetClientV3 && len(c.wkc) > 0 {
+		encoded = append(append([]byte(nil), encoded...), c.wkc...)
 	}
 	return c.io.WritePacket(ctx, encoded)
 }
@@ -388,7 +409,7 @@ func (c *ControlChannel) readControlPacket(ctx context.Context) (*ControlPacket,
 	if err != nil {
 		return nil, err
 	}
-	packet, _, _, err := DecodeControlPacket(c.crypt, raw)
+	packet, _, _, err := DecodeControlPacket(c.wrapper, raw)
 	return packet, err
 }
 
