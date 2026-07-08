@@ -343,15 +343,28 @@ func (o *OpenVPN) startLocked(handshakeCtx context.Context) (wireguard.Device, r
 	o.client = client
 	o.tunDevice = tunDevice
 	o.running = true
-	if o.option.RemoteDnsResolve && len(o.dns) > 0 && o.resolver == nil {
-		nss := append([]dns.NameServer(nil), o.dns...)
-		for i := range nss {
-			nss[i].ProxyAdapter = o
+	if o.option.RemoteDnsResolve && o.resolver == nil {
+		var nss []dns.NameServer
+		if len(o.dns) > 0 {
+			nss = append([]dns.NameServer(nil), o.dns...)
+		} else if len(push.DNS) > 0 {
+			for _, addr := range push.DNS {
+				nss = append(nss, dns.NameServer{
+					Net:  "udp",
+					Addr: net.JoinHostPort(addr.String(), "53"),
+				})
+			}
 		}
-		o.resolver = dns.NewResolver(dns.Config{
-			Main: nss,
-			IPv6: openVPNPrefixesHas6(push.Prefixes),
-		})
+
+		if len(nss) > 0 {
+			for i := range nss {
+				nss[i].ProxyAdapter = o
+			}
+			o.resolver = dns.NewResolver(dns.Config{
+				Main: nss,
+				IPv6: openVPNPrefixesHas6(push.Prefixes),
+			})
+		}
 	}
 	o.startPacketLoops(pingInterval, pingRestart)
 	return o.tunDevice, o.resolver, nil
