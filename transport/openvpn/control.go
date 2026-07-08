@@ -20,6 +20,37 @@ type PacketIO interface {
 	RemoteAddr() net.Addr
 }
 
+const (
+	// ControlRetransmitInterval mirrors --tls-timeout: an un-ACKed control
+	// packet is retransmitted after 2 seconds, doubling per attempt.
+	ControlRetransmitInterval    = 2 * time.Second
+	ControlRetransmitMaxInterval = 16 * time.Second
+
+	// maxControlPayload caps the TLS bytes carried by one P_CONTROL_V1.
+	// The reference implementation limits whole control packets to
+	// --max-packet-size (default 1250); after the worst-case tls-crypt,
+	// session, ACK and message-id overhead (~80 bytes) a 1024-byte payload
+	// keeps every control packet safely below common path MTUs, so large
+	// TLS flights (client certificates!) no longer rely on IP
+	// fragmentation, which many networks drop.
+	maxControlPayload = 1024
+
+	// controlSendAckMax mirrors CONTROL_SEND_ACK_MAX: at most this many
+	// ACKs hitch a ride on an outgoing non-P_ACK_V1 control packet.
+	controlSendAckMax = 4
+	// reliableAckSize mirrors RELIABLE_ACK_SIZE: the largest ACK array a
+	// standalone P_ACK_V1 may carry.
+	reliableAckSize = 8
+)
+
+// pendingControl tracks an outgoing reliable packet awaiting an ACK,
+// with its retransmission schedule.
+type pendingControl struct {
+	packet   *ControlPacket
+	nextSend time.Time
+	interval time.Duration
+}
+
 type ControlChannel struct {
 	io     PacketIO
 	crypt  *TLSCrypt
@@ -33,7 +64,7 @@ type ControlChannel struct {
 	sendMessage   uint32
 	recvMessage   uint32
 	ackPending    []uint32
-	pending       map[uint32]*ControlPacket
+	pending       map[uint32]*pendingControl
 	recvPending   map[uint32]*ControlPacket
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -45,7 +76,7 @@ func NewControlChannel(io PacketIO, crypt *TLSCrypt, local SessionID) *ControlCh
 		crypt:       crypt,
 		clock:       time.Now,
 		local:       local,
-		pending:     make(map[uint32]*ControlPacket),
+		pending:     make(map[uint32]*pendingControl),
 		recvPending: make(map[uint32]*ControlPacket),
 	}
 }
@@ -83,13 +114,16 @@ func (c *ControlChannel) Send(ctx context.Context, opcode Opcode, payload []byte
 		Opcode:           opcode,
 		KeyID:            c.keyID,
 		LocalSession:     c.local,
-		AckIDs:           append([]uint32(nil), c.ackPending...),
+		AckIDs:           c.takeAcksLocked(controlSendAckMax),
 		AckRemoteSession: c.remote,
 		MessageID:        messageID,
 		Payload:          cloneBytes(payload),
 	}
-	c.ackPending = nil
-	c.pending[messageID] = packet
+	c.pending[messageID] = &pendingControl{
+		packet:   packet,
+		nextSend: c.clock().Add(ControlRetransmitInterval),
+		interval: ControlRetransmitInterval,
+	}
 	c.mu.Unlock()
 
 	if err := c.writeControlPacket(ctx, packet); err != nil {
@@ -98,22 +132,45 @@ func (c *ControlChannel) Send(ctx context.Context, opcode Opcode, payload []byte
 	return messageID, nil
 }
 
-func (c *ControlChannel) SendAck(ctx context.Context) error {
-	c.mu.Lock()
+// takeAcksLocked removes and returns at most limit pending ACK ids;
+// c.mu must be held.
+func (c *ControlChannel) takeAcksLocked(limit int) []uint32 {
 	if len(c.ackPending) == 0 {
-		c.mu.Unlock()
 		return nil
 	}
-	packet := &ControlPacket{
-		Opcode:           PAckV1,
-		KeyID:            c.keyID,
-		LocalSession:     c.local,
-		AckIDs:           append([]uint32(nil), c.ackPending...),
-		AckRemoteSession: c.remote,
+	n := len(c.ackPending)
+	if n > limit {
+		n = limit
 	}
-	c.ackPending = nil
-	c.mu.Unlock()
-	return c.writeControlPacket(ctx, packet)
+	acks := append([]uint32(nil), c.ackPending[:n]...)
+	if n == len(c.ackPending) {
+		c.ackPending = nil
+	} else {
+		c.ackPending = append([]uint32(nil), c.ackPending[n:]...)
+	}
+	return acks
+}
+
+func (c *ControlChannel) SendAck(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		acks := c.takeAcksLocked(reliableAckSize)
+		if len(acks) == 0 {
+			c.mu.Unlock()
+			return nil
+		}
+		packet := &ControlPacket{
+			Opcode:           PAckV1,
+			KeyID:            c.keyID,
+			LocalSession:     c.local,
+			AckIDs:           acks,
+			AckRemoteSession: c.remote,
+		}
+		c.mu.Unlock()
+		if err := c.writeControlPacket(ctx, packet); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *ControlChannel) Read(ctx context.Context) (*ControlPacket, error) {
@@ -141,6 +198,13 @@ func (c *ControlChannel) Read(ctx context.Context) (*ControlPacket, error) {
 		}
 		for _, ackID := range packet.AckIDs {
 			delete(c.pending, ackID)
+		}
+		if packet.Opcode == PControlSoftResetV1 {
+			// A soft reset opens a new key session: its message id lives in
+			// a fresh reliable-layer space, so it must not be merged into
+			// (or ACKed within) the current stream. Surface it directly.
+			c.mu.Unlock()
+			return packet, nil
 		}
 		if packet.Opcode.HasMessageID() {
 			c.ackPending = appendAck(c.ackPending, packet.MessageID)
@@ -181,24 +245,78 @@ func (c *ControlChannel) PendingMessages() int {
 	return len(c.pending)
 }
 
-func (c *ControlChannel) RetransmitPending(ctx context.Context) error {
+// ClearPending drops un-ACKed outgoing packets. Called when a handshake
+// phase completes and the peer demonstrably received everything (it
+// answered), so late ACK loss must not trigger pointless retransmissions.
+func (c *ControlChannel) ClearPending() {
 	c.mu.Lock()
-	packets := make([]*ControlPacket, 0, len(c.pending))
-	for _, packet := range c.pending {
-		cp := *packet
-		cp.AckIDs = append([]uint32(nil), c.ackPending...)
-		cp.AckRemoteSession = c.remote
-		packets = append(packets, &cp)
-	}
-	c.ackPending = nil
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.pending = make(map[uint32]*pendingControl)
+}
 
-	for _, packet := range packets {
-		if err := c.writeControlPacket(ctx, packet); err != nil {
-			return err
+// RetransmitDue resends every reliable packet whose retransmission timer
+// expired, doubling its backoff, and reports how long the caller may sleep
+// before the next packet becomes due.
+func (c *ControlChannel) RetransmitDue(ctx context.Context) (time.Duration, error) {
+	now := c.clock()
+	wait := ControlRetransmitInterval
+
+	c.mu.Lock()
+	var due []*ControlPacket
+	for _, entry := range c.pending {
+		if !entry.nextSend.After(now) {
+			entry.interval *= 2
+			if entry.interval > ControlRetransmitMaxInterval {
+				entry.interval = ControlRetransmitMaxInterval
+			}
+			entry.nextSend = now.Add(entry.interval)
+			// Retransmissions carry part of the current ACK backlog and
+			// always get a fresh tls-crypt packet id (assigned in
+			// writeControlPacket).
+			cp := *entry.packet
+			cp.AckIDs = c.takeAcksLocked(controlSendAckMax)
+			cp.AckRemoteSession = c.remote
+			due = append(due, &cp)
+		}
+		if until := entry.nextSend.Sub(now); until < wait {
+			wait = until
 		}
 	}
-	return nil
+	c.mu.Unlock()
+
+	for _, packet := range due {
+		if err := c.writeControlPacket(ctx, packet); err != nil {
+			return wait, err
+		}
+	}
+	return wait, nil
+}
+
+// RunRetransmitter drives the reliability layer until ctx is cancelled,
+// mirroring the reference implementation's --tls-timeout handling. Without
+// it a single lost UDP control packet stalls the whole handshake.
+func (c *ControlChannel) RunRetransmitter(ctx context.Context) {
+	timer := time.NewTimer(ControlRetransmitInterval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		wait, err := c.RetransmitDue(ctx)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Transient write failure: keep the packet pending and retry
+			// on the next tick.
+		}
+		if wait < 100*time.Millisecond {
+			wait = 100 * time.Millisecond
+		}
+		timer.Reset(wait)
+	}
 }
 
 func (c *ControlChannel) writeControlPacket(ctx context.Context, packet *ControlPacket) error {
@@ -277,10 +395,22 @@ type ControlConn struct {
 	readBuf []byte
 	closed  bool
 	mu      sync.Mutex
+
+	// notify, when set, observes non-P_CONTROL_V1 packets (e.g. soft
+	// resets) seen while reading the TLS stream. A returned error aborts
+	// the read, surfacing session-level events through the TLS layer.
+	notify func(*ControlPacket) error
 }
 
 func NewControlConn(channel *ControlChannel) *ControlConn {
 	return &ControlConn{channel: channel}
+}
+
+// SetNotify installs the observer for non-TLS control packets. It must be
+// set before the next Read; there is no synchronization with a concurrent
+// reader.
+func (c *ControlConn) SetNotify(notify func(*ControlPacket) error) {
+	c.notify = notify
 }
 
 func (c *ControlConn) Read(b []byte) (int, error) {
@@ -303,6 +433,11 @@ func (c *ControlConn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 		if packet.Opcode != PControlV1 {
+			if c.notify != nil {
+				if err := c.notify(packet); err != nil {
+					return 0, err
+				}
+			}
 			if err := c.channel.SendAck(context.Background()); err != nil {
 				return 0, err
 			}
@@ -332,10 +467,23 @@ func (c *ControlConn) Write(b []byte) (int, error) {
 	}
 	c.mu.Unlock()
 
-	if _, err := c.channel.Send(context.Background(), PControlV1, b); err != nil {
-		return 0, err
+	// Fragment the TLS byte stream: one oversized control packet would be
+	// sent as a fragmented IP datagram over UDP, which many paths drop.
+	// The peer's reliability layer reassembles the stream from the
+	// per-message ids, so chunk boundaries are invisible to TLS.
+	total := 0
+	for len(b) > 0 {
+		chunk := b
+		if len(chunk) > maxControlPayload {
+			chunk = b[:maxControlPayload]
+		}
+		if _, err := c.channel.Send(context.Background(), PControlV1, chunk); err != nil {
+			return total, err
+		}
+		total += len(chunk)
+		b = b[len(chunk):]
 	}
-	return len(b), nil
+	return total, nil
 }
 
 func (c *ControlConn) Close() error {

@@ -5,30 +5,57 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 )
 
-const PushRequest = "PUSH_REQUEST"
+const (
+	PushRequest = "PUSH_REQUEST"
+
+	// PushRequestInterval matches PUSH_REQUEST_INTERVAL in the reference
+	// implementation: the client repeats PUSH_REQUEST until it gets a reply.
+	PushRequestInterval = 5 * time.Second
+
+	// push-continuation values from the reference implementation: a reply
+	// carrying "push-continuation 2" is partial and more messages follow;
+	// "push-continuation 1" marks the final message of a multi-part push.
+	pushContinuationPartial = 2
+	pushContinuationEnd     = 1
+)
 
 type PushReply struct {
-	Raw       string
-	Prefixes  []netip.Prefix
-	Routes    []netip.Prefix
-	DNS       []netip.Addr
-	PeerID    uint32
-	Redirect  bool
-	BlockIPv6 bool
+	Raw         string
+	Prefixes    []netip.Prefix
+	Routes      []netip.Prefix
+	DNS         []netip.Addr
+	PeerID      uint32
+	Redirect    bool
+	BlockIPv6   bool
+	Ping        time.Duration
+	PingRestart time.Duration
 }
 
 func ParsePushReply(message string) (*PushReply, error) {
-	message = strings.TrimRight(message, "\x00")
-	if !strings.HasPrefix(message, "PUSH_REPLY") {
-		return nil, fmt.Errorf("unexpected openvpn push message %q", message)
+	return ParsePushReplyMessages([]string{message})
+}
+
+// ParsePushReplyMessages merges one or more PUSH_REPLY control messages
+// (a multi-part push linked by push-continuation) into a single reply.
+func ParsePushReplyMessages(messages []string) (*PushReply, error) {
+	var raw []string
+	var options []string
+	for _, message := range messages {
+		message = strings.TrimRight(message, "\x00")
+		if !strings.HasPrefix(message, "PUSH_REPLY") {
+			return nil, fmt.Errorf("unexpected openvpn push message %q", message)
+		}
+		raw = append(raw, message)
+		options = append(options, splitPushOptions(message)...)
 	}
 	reply := &PushReply{
-		Raw:    message,
+		Raw:    strings.Join(raw, "\n"),
 		PeerID: PeerIDUnset,
 	}
-	for _, option := range splitPushOptions(message) {
+	for _, option := range options {
 		fields := strings.Fields(option)
 		if len(fields) == 0 {
 			continue
@@ -84,12 +111,38 @@ func ParsePushReply(message string) (*PushReply, error) {
 			reply.Redirect = true
 		case "block-ipv6":
 			reply.BlockIPv6 = true
+		case "ping":
+			if len(fields) >= 2 {
+				if seconds, err := strconv.Atoi(fields[1]); err == nil && seconds > 0 {
+					reply.Ping = time.Duration(seconds) * time.Second
+				}
+			}
+		case "ping-restart":
+			if len(fields) >= 2 {
+				if seconds, err := strconv.Atoi(fields[1]); err == nil && seconds > 0 {
+					reply.PingRestart = time.Duration(seconds) * time.Second
+				}
+			}
 		}
 	}
 	if len(reply.Prefixes) == 0 {
 		return nil, fmt.Errorf("openvpn push reply missing ifconfig address")
 	}
 	return reply, nil
+}
+
+// pushReplyContinuation reports the push-continuation value carried by a
+// single PUSH_REPLY message (0 when the reply is self-contained).
+func pushReplyContinuation(message string) int {
+	for _, option := range splitPushOptions(message) {
+		fields := strings.Fields(option)
+		if len(fields) >= 2 && fields[0] == "push-continuation" {
+			if value, err := strconv.Atoi(fields[1]); err == nil {
+				return value
+			}
+		}
+	}
+	return 0
 }
 
 func splitPushOptions(message string) []string {

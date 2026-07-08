@@ -87,14 +87,22 @@ func (r *KeyMethod2Record) MarshalClient() ([]byte, error) {
 }
 
 func ParseServerKeyMethod2Record(packet []byte) (*KeyMethod2Record, error) {
+	record, _, err := parseServerKeyMethod2Record(packet)
+	return record, err
+}
+
+// parseServerKeyMethod2Record also returns how many bytes of packet the
+// record occupies, so callers can preserve trailing data (the server may
+// coalesce its key method record with e.g. a PUSH_REPLY in one TLS flight).
+func parseServerKeyMethod2Record(packet []byte) (*KeyMethod2Record, int, error) {
 	if len(packet) < 4+1+keySourceRandomSize*2 {
-		return nil, errors.New("key method 2 packet too short")
+		return nil, 0, fmt.Errorf("key method 2 packet too short: %w", ioStringEOF)
 	}
 	if binary.BigEndian.Uint32(packet[:4]) != 0 {
-		return nil, errors.New("invalid key method 2 prefix")
+		return nil, 0, errors.New("invalid key method 2 prefix")
 	}
 	if packet[4]&0x0f != KeyMethod2 {
-		return nil, fmt.Errorf("unsupported key method %d", packet[4])
+		return nil, 0, fmt.Errorf("unsupported key method %d", packet[4])
 	}
 	offset := 5
 	record := &KeyMethod2Record{}
@@ -106,12 +114,21 @@ func ParseServerKeyMethod2Record(packet []byte) (*KeyMethod2Record, error) {
 	var err error
 	record.Options, offset, err = readOpenVPNString(packet, offset)
 	if err != nil {
-		return nil, fmt.Errorf("read options: %w", err)
+		return nil, 0, fmt.Errorf("read options: %w", err)
 	}
-	record.Username, offset, _ = readOpenVPNString(packet, offset)
-	record.Password, offset, _ = readOpenVPNString(packet, offset)
-	record.PeerInfo, _, _ = readOpenVPNString(packet, offset)
-	return record, nil
+	// A server record normally ends after the options string; the remaining
+	// strings are only written by clients. Read them leniently and stop at
+	// the first field that is absent.
+	if username, next, err := readOpenVPNString(packet, offset); err == nil {
+		record.Username, offset = username, next
+		if password, next, err := readOpenVPNString(packet, offset); err == nil {
+			record.Password, offset = password, next
+			if peerInfo, next, err := readOpenVPNString(packet, offset); err == nil {
+				record.PeerInfo, offset = peerInfo, next
+			}
+		}
+	}
+	return record, offset, nil
 }
 
 func DeriveClientKeyMaterial(sources KeySource2, clientSession, serverSession SessionID, cipherKeyLen int) (*KeyMaterial, error) {

@@ -3,6 +3,7 @@ package openvpn
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -129,5 +130,43 @@ func TestParseServerKeyMethod2Record(t *testing.T) {
 	}
 	if record.Sources.Server.Random1[0] != 1 || record.Sources.Server.Random2[0] != 2 {
 		t.Fatalf("unexpected server randoms")
+	}
+}
+
+func TestParseServerKeyMethod2RecordKeepsTrailingData(t *testing.T) {
+	var packet []byte
+	packet = binary.BigEndian.AppendUint32(packet, 0)
+	packet = append(packet, KeyMethod2)
+	packet = append(packet, bytes.Repeat([]byte{1}, keySourceRandomSize)...)
+	packet = append(packet, bytes.Repeat([]byte{2}, keySourceRandomSize)...)
+	packet = appendOpenVPNString(packet, "server-options")
+	recordLen := len(packet)
+
+	// A server may coalesce an early PUSH_REPLY into the same flight.
+	trailing := []byte("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0\x00")
+	record, consumed, err := parseServerKeyMethod2Record(append(packet, trailing...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Options != "server-options" {
+		t.Fatalf("unexpected options: %q", record.Options)
+	}
+	if consumed != recordLen {
+		t.Fatalf("expected %d consumed bytes, got %d", recordLen, consumed)
+	}
+}
+
+func TestParseServerKeyMethod2RecordTruncatedIsRetryable(t *testing.T) {
+	var packet []byte
+	packet = binary.BigEndian.AppendUint32(packet, 0)
+	packet = append(packet, KeyMethod2)
+	packet = append(packet, bytes.Repeat([]byte{1}, keySourceRandomSize)...)
+	packet = append(packet, bytes.Repeat([]byte{2}, keySourceRandomSize)...)
+	packet = appendOpenVPNString(packet, "server-options")
+
+	for _, cut := range []int{3, 40, len(packet) - 1} {
+		if _, _, err := parseServerKeyMethod2Record(packet[:cut]); !errors.Is(err, ioStringEOF) {
+			t.Fatalf("truncation at %d bytes must be retryable, got %v", cut, err)
+		}
 	}
 }

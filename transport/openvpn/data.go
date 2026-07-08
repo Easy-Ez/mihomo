@@ -188,7 +188,10 @@ func (d *DataChannel) Encrypt(packet []byte) ([]byte, error) {
 		return nil, errors.New("nil openvpn data channel")
 	}
 
-	packetID := d.nextPacketID()
+	packetID, err := d.nextPacketID()
+	if err != nil {
+		return nil, err
+	}
 	if d.sendAEAD != nil {
 		return d.encryptAEAD(packet, packetID)
 	}
@@ -339,11 +342,18 @@ func dataPacketHeaderSize(packet []byte) (int, error) {
 	}
 }
 
-func (d *DataChannel) nextPacketID() uint32 {
+func (d *DataChannel) nextPacketID() (uint32, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// The packet id must never wrap: for AEAD ciphers it is the unique part
+	// of the nonce. The reference implementation renegotiates keys long
+	// before this point; until renegotiation is supported, fail hard so the
+	// session is torn down and re-established instead of reusing a nonce.
+	if d.sendPacketID == ^uint32(0) {
+		return 0, errors.New("openvpn data channel packet id exhausted")
+	}
 	d.sendPacketID++
-	return d.sendPacketID
+	return d.sendPacketID, nil
 }
 
 func (d *DataChannel) acceptPacketID(packetID uint32) error {
