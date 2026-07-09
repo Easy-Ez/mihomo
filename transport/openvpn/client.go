@@ -211,7 +211,7 @@ func (c *Client) negotiateKeys(ctx context.Context) (*KeySource2, error) {
 	log.Infoln("[OpenVPN] TLS established: version=0x%04x cipher-suite=%s", cs.Version, tls.CipherSuiteName(cs.CipherSuite))
 
 	if c.optionsString == "" {
-		c.optionsString = installScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.compressMode)
+		c.optionsString = installScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.compressMode, c.config.TunMTU)
 	}
 	username := strings.TrimSpace(c.config.Username)
 	password := c.config.Password
@@ -223,9 +223,13 @@ func (c *Client) negotiateKeys(ctx context.Context) (*KeySource2, error) {
 			username = push.AuthTokenUser
 		}
 	}
+	peerInfo := installScriptPeerInfo(c.config.Cipher, c.config.compressMode, c.config.PeerInfo)
+	log.Infoln("[OpenVPN] client options string: %s", c.optionsString)
+	log.Debugln("[OpenVPN] client peer info: %s", peerInfo)
+
 	clientRecord, err := NewClientKeyMethod2Record(
 		c.optionsString,
-		installScriptPeerInfo(c.config.Cipher, c.config.compressMode, c.config.PeerInfo),
+		peerInfo,
 		username,
 		password,
 	)
@@ -726,6 +730,7 @@ func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read push reply: %w", err)
 		}
+		log.Infoln("[OpenVPN] received control message: %s", msg)
 		switch {
 		case strings.HasPrefix(msg, "PUSH_REPLY"):
 			messages = append(messages, msg)

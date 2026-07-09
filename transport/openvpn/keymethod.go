@@ -172,7 +172,7 @@ func DeriveClientKeyMaterial(sources KeySource2, clientSession, serverSession Se
 	}, nil
 }
 
-func installScriptOptionsString(proto, cipher, auth string, mode compressionMode) string {
+func installScriptOptionsString(proto, cipher, auth string, mode compressionMode, tunMTU int) string {
 	protoName := "UDPv4"
 	if proto == ProtoTCP {
 		protoName = "TCPv4_CLIENT"
@@ -181,13 +181,17 @@ func installScriptOptionsString(proto, cipher, auth string, mode compressionMode
 	if cipher == CipherAES256GCM || cipher == CipherAES256CBC || cipher == CipherChaCha20Poly1305 {
 		keysize = "256"
 	}
-	mtu := "1550"
+	if tunMTU <= 0 {
+		tunMTU = 1500
+	}
+	mtuInt := tunMTU + 50
 	comp := ""
 	if mode == compressLZO {
-		mtu = "1544"
+		mtuInt = tunMTU + 44
 		comp = "comp-lzo,"
 	}
-	return fmt.Sprintf("V4,dev-type tun,link-mtu %s,tun-mtu 1500,proto %s,%scipher %s,auth %s,keysize %s,key-method 2,tls-client", mtu, protoName, comp, cipher, auth, keysize)
+	mtu := fmt.Sprintf("%d", mtuInt)
+	return fmt.Sprintf("V4,dev-type tun,link-mtu %s,tun-mtu %d,proto %s,%scipher %s,auth %s,keysize %s,key-method 2,tls-client", mtu, tunMTU, protoName, comp, cipher, auth, keysize)
 }
 
 func installScriptPeerInfo(cipher string, mode compressionMode, peerInfo map[string]string) string {
@@ -200,11 +204,19 @@ func installScriptPeerInfo(cipher string, mode compressionMode, peerInfo map[str
 	case compressV2Stub:
 		comp = "IV_COMP_STUBv2=1\nIV_COMP_STUB=1\nIV_LZO_STUB=1\n"
 	}
-	info := fmt.Sprintf("IV_VER=mihomo-openvpn\nIV_PROTO=6\n%sIV_CIPHERS=%s\n", comp, dataCiphersList(cipher))
+	
+	// The server's strict DPI firewall relies on the exact ordering of the initial core variables.
+	// We must hardcode the standard official client order to bypass the fingerprinting.
+	info := fmt.Sprintf("IV_VER=3.8.4\nIV_PLAT=mac\nIV_PROTO=2\nIV_NCP=2\nIV_TCPNL=1\nIV_LZO=1\nIV_COMP_STUBv2=1\nIV_COMP_STUB=1\n%sIV_CIPHERS=%s\n", comp, dataCiphersList(cipher))
+
 	// Append user-defined peer-info entries (e.g. IV_HWADDR, UV_*) after the
 	// built-in fields. Keys are sorted so the output is deterministic.
 	keys := make([]string, 0, len(peerInfo))
 	for key := range peerInfo {
+		// Filter out the ones we hardcoded to prevent duplicates
+		if key == "IV_VER" || key == "IV_PLAT" || key == "IV_PROTO" || key == "IV_NCP" || key == "IV_TCPNL" || key == "IV_LZO" || key == "IV_COMP_STUBv2" || key == "IV_COMP_STUB" {
+			continue
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)

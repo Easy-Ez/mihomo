@@ -85,6 +85,7 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
 		Auth:       option.Auth,
 		CompLZO:    option.CompLZO,
 		Compress:   option.Compress,
+		TunMTU:     option.MTU,
 		CA:         []byte(option.CA),
 		Cert:       []byte(option.Cert),
 		Key:        []byte(option.Key),

@@ -53,6 +53,8 @@ type ClientConfig struct {
 	// compressMode is the framing resolved from CompLZO/Compress in Prepare.
 	compressMode compressionMode
 
+	TunMTU int
+
 	CA         []byte
 	Cert       []byte
 	Key        []byte
