@@ -9,6 +9,7 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/component/transportstat"
 	"github.com/metacubex/mihomo/transport/tuic/types"
 
 	"github.com/metacubex/quic-go"
@@ -16,9 +17,11 @@ import (
 )
 
 type quicStreamPacketConn struct {
-	connId    uint16
-	quicConn  *quic.Conn
-	inputConn *N.BufferedConn
+	connId      uint16
+	quicConn    *quic.Conn
+	inputConn   *N.BufferedConn
+	transportID string
+	streamStats *transportstat.StreamStats
 
 	udpRelayMode          types.UdpRelayMode
 	maxUdpRelayPacketSize int
@@ -146,6 +149,10 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 		_ = q.Close()
 		return 0, net.ErrClosed
 	}
+	startedAt := time.Now()
+	defer func() {
+		q.streamStats.ObserveWrite(time.Since(startedAt))
+	}()
 	if q.deferQuicConnFn != nil {
 		defer func() {
 			q.deferQuicConnFn(q.quicConn, err)
@@ -202,6 +209,14 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 
 func (q *quicStreamPacketConn) LocalAddr() net.Addr {
 	return q.quicConn.LocalAddr()
+}
+
+func (q *quicStreamPacketConn) TransportID() string {
+	return q.transportID
+}
+
+func (q *quicStreamPacketConn) TransportStreamStats() *transportstat.StreamStats {
+	return q.streamStats
 }
 
 var _ net.PacketConn = (*quicStreamPacketConn)(nil)

@@ -9,9 +9,11 @@ import (
 	"github.com/metacubex/mihomo/common/buf"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/transportstat"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/gofrs/uuid/v5"
+	"github.com/metacubex/sing/common"
 )
 
 type Tracker interface {
@@ -22,15 +24,17 @@ type Tracker interface {
 }
 
 type TrackerInfo struct {
-	UUID          uuid.UUID    `json:"id"`
-	Metadata      *C.Metadata  `json:"metadata"`
-	UploadTotal   atomic.Int64 `json:"upload"`
-	DownloadTotal atomic.Int64 `json:"download"`
-	Start         time.Time    `json:"start"`
-	Chain         C.Chain      `json:"chains"`
-	ProviderChain C.Chain      `json:"providerChains"`
-	Rule          string       `json:"rule"`
-	RulePayload   string       `json:"rulePayload"`
+	UUID           uuid.UUID                  `json:"id"`
+	Metadata       *C.Metadata                `json:"metadata"`
+	UploadTotal    atomic.Int64               `json:"upload"`
+	DownloadTotal  atomic.Int64               `json:"download"`
+	Start          time.Time                  `json:"start"`
+	Chain          C.Chain                    `json:"chains"`
+	ProviderChain  C.Chain                    `json:"providerChains"`
+	Rule           string                     `json:"rule"`
+	RulePayload    string                     `json:"rulePayload"`
+	TransportID    string                     `json:"transportId,omitempty"`
+	TransportStats *transportstat.StreamStats `json:"transportStats,omitempty"`
 }
 
 type tcpTracker struct {
@@ -148,6 +152,7 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
 		t.TrackerInfo.Rule = rule.RuleType().String()
 		t.TrackerInfo.RulePayload = rule.Payload()
 	}
+	attachTransportStats(t.TrackerInfo, conn)
 
 	manager.Join(t)
 	return t
@@ -240,7 +245,17 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
 		ut.TrackerInfo.Rule = rule.RuleType().String()
 		ut.TrackerInfo.RulePayload = rule.Payload()
 	}
+	attachTransportStats(ut.TrackerInfo, conn)
 
 	manager.Join(ut)
 	return ut
+}
+
+func attachTransportStats(info *TrackerInfo, conn any) {
+	provider, ok := common.Cast[transportstat.StreamProvider](conn)
+	if !ok {
+		return
+	}
+	info.TransportID = provider.TransportID()
+	info.TransportStats = provider.TransportStreamStats()
 }

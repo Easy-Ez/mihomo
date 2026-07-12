@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/transport/tuic/metrics"
 	"github.com/metacubex/mihomo/transport/tuic/types"
 
 	"github.com/metacubex/quic-go"
@@ -289,11 +290,15 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net
 		if err != nil {
 			return nil, err
 		}
-		stream = types.NewQuicStreamConn(
+		transportID, streamStats, closeTransportStream := metrics.OpenStream(quicConn)
+		stream = types.NewObservedQuicStreamConn(
 			quicStream,
 			quicConn.LocalAddr(),
 			quicConn.RemoteAddr(),
+			transportID,
+			streamStats,
 			func() {
+				closeTransportStream()
 				time.AfterFunc(C.DefaultTCPTimeout, func() {
 					openStreams := t.openStreams.Add(-1)
 					if openStreams == 0 && t.closed.Load() {
@@ -336,14 +341,18 @@ func (t *clientImpl) ListenPacket(ctx context.Context, metadata *C.Metadata) (ne
 			break
 		}
 	}
+	transportID, streamStats, closeTransportStream := metrics.OpenStream(quicConn)
 	pc := &quicStreamPacketConn{
 		connId:                connId,
 		quicConn:              quicConn,
 		inputConn:             N.NewBufferedConn(pipe2),
+		transportID:           transportID,
+		streamStats:           streamStats,
 		udpRelayMode:          t.UdpRelayMode,
 		maxUdpRelayPacketSize: t.MaxUdpRelayPacketSize,
 		deferQuicConnFn:       t.deferQuicConn,
 		closeDeferFn: func() {
+			closeTransportStream()
 			t.udpInputMap.Delete(connId)
 			time.AfterFunc(C.DefaultUDPTimeout, func() {
 				openStreams := t.openStreams.Add(-1)

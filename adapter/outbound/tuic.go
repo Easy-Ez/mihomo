@@ -13,6 +13,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/tuic"
 	"github.com/metacubex/mihomo/transport/tuic/common"
+	"github.com/metacubex/mihomo/transport/tuic/metrics"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/quic-go"
@@ -110,11 +111,13 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 }
 
 func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
-	_, quicConn, err = common.DialQuic(ctx, t.addr, t.DialOptions(), t.dialer, t.tlsConfig, t.quicConfig, t.option.ReduceRtt)
+	traceContext, trace := metrics.WithTrace(ctx)
+	_, quicConn, err = common.DialQuic(traceContext, t.addr, t.DialOptions(), t.dialer, t.tlsConfig, t.quicConfig, t.option.ReduceRtt)
 	if err != nil {
 		return nil, err
 	}
-	common.SetCongestionController(quicConn, t.option.CongestionController, t.option.CWND, t.option.BBRProfile)
+	controller := common.NewCongestionController(quicConn, t.option.CongestionController, t.option.CWND, t.option.BBRProfile)
+	metrics.ObserveClientTransport(t.Name(), quicConn, controller, trace)
 	return quicConn, nil
 }
 
@@ -206,6 +209,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		MaxDatagramFrameSize:           int64(option.MaxDatagramFrameSize),
 		EnableDatagrams:                true,
 	}
+	quicConfig.Tracer = metrics.NewTracer(quicConfig.Tracer)
 	if option.ReceiveWindowConn == 0 {
 		quicConfig.InitialStreamReceiveWindow = tuic.DefaultStreamReceiveWindow / 10
 		quicConfig.MaxStreamReceiveWindow = tuic.DefaultStreamReceiveWindow

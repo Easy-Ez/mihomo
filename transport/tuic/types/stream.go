@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/transportstat"
+
 	"github.com/metacubex/quic-go"
 )
 
@@ -14,6 +16,9 @@ type quicStreamConn struct {
 	lAddr net.Addr
 	rAddr net.Addr
 
+	transportID string
+	streamStats *transportstat.StreamStats
+
 	closeDeferFn func()
 
 	closeOnce sync.Once
@@ -21,9 +26,21 @@ type quicStreamConn struct {
 }
 
 func (q *quicStreamConn) Write(p []byte) (n int, err error) {
+	startedAt := time.Now()
+	defer func() {
+		q.streamStats.ObserveWrite(time.Since(startedAt))
+	}()
 	q.lock.Lock()
 	defer q.lock.Unlock()
 	return q.Stream.Write(p)
+}
+
+func (q *quicStreamConn) TransportID() string {
+	return q.transportID
+}
+
+func (q *quicStreamConn) TransportStreamStats() *transportstat.StreamStats {
+	return q.streamStats
 }
 
 func (q *quicStreamConn) Close() error {
@@ -64,4 +81,11 @@ var _ net.Conn = (*quicStreamConn)(nil)
 
 func NewQuicStreamConn(stream *quic.Stream, lAddr, rAddr net.Addr, closeDeferFn func()) net.Conn {
 	return &quicStreamConn{Stream: stream, lAddr: lAddr, rAddr: rAddr, closeDeferFn: closeDeferFn}
+}
+
+func NewObservedQuicStreamConn(stream *quic.Stream, lAddr, rAddr net.Addr, transportID string, streamStats *transportstat.StreamStats, closeDeferFn func()) net.Conn {
+	return &quicStreamConn{
+		Stream: stream, lAddr: lAddr, rAddr: rAddr,
+		transportID: transportID, streamStats: streamStats, closeDeferFn: closeDeferFn,
+	}
 }
