@@ -3,7 +3,9 @@ package metrics
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/metacubex/mihomo/component/transportstat"
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/congestion"
 	"github.com/metacubex/quic-go/monotime"
@@ -73,6 +75,25 @@ func TestExtendedCongestionControllerMetrics(t *testing.T) {
 	})
 	if observation.packetsLostTotal.Load() != 2 || observation.bytesLostTotal.Load() != 300 {
 		t.Fatalf("unexpected extended loss totals: packets=%d bytes=%d", observation.packetsLostTotal.Load(), observation.bytesLostTotal.Load())
+	}
+}
+
+func TestExtendedCongestionControllerDoesNotReportProbeRTTAsCollapse(t *testing.T) {
+	events, cancel := transportstat.DefaultManager.Subscribe(4)
+	defer cancel()
+	observation := &observation{id: "transport-probe-rtt", adapter: "US"}
+	controller := wrapCongestionController(&fakeCongestionControllerEx{
+		fakeCongestionController: &fakeCongestionController{cwnd: 2000},
+	}, observation)
+	extended := controller.(congestion.CongestionControlEx)
+	extended.OnCongestionEventEx(0, monotime.Now(), nil, nil)
+	if observation.cwnd.Load() != 1000 {
+		t.Fatalf("cwnd = %d, want 1000", observation.cwnd.Load())
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected event for loss-free window reduction: %+v", event)
+	case <-time.After(20 * time.Millisecond):
 	}
 }
 

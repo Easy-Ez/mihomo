@@ -168,9 +168,9 @@ func (o *observation) publishPTO(total, delta uint64) {
 	})
 }
 
-func (o *observation) recordCongestionWindow(before, after uint64) {
+func (o *observation) recordCongestionWindow(before, after uint64, lossDetected bool) {
 	o.cwnd.Store(after)
-	if before > 0 && after*2 < before {
+	if lossDetected && before > 0 && after*2 < before {
 		transportstat.DefaultManager.Publish(transportstat.Event{
 			Type: transportstat.EventCwndCollapse, TransportID: o.id, Adapter: o.adapter, Protocol: "tuic", Before: before, After: after,
 		})

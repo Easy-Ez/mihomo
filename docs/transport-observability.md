@@ -33,7 +33,7 @@ Each TUIC snapshot includes:
 - `transport_reconnected`
 - `packet_loss`
 - `pto`
-- `cwnd_collapse`
+- `cwnd_collapse` (a greater-than-50% congestion-window reduction associated with reported packet loss; loss-free BBR ProbeRTT transitions are not classified as collapses)
 - `heartbeat`
 
 Events have monotonically increasing sequence numbers. A gap indicates that a slow consumer missed events and should reconcile from `/transports`. A `transport_closed` event contains the final transport snapshot so collectors do not lose the last counters between polling intervals.

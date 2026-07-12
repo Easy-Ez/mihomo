@@ -41,7 +41,7 @@ func (m *monitoredCongestionController) OnCongestionEvent(number congestion.Pack
 	m.CongestionControl.OnCongestionEvent(number, lostBytes, priorInFlight)
 	after := uint64(m.CongestionControl.GetCongestionWindow())
 	m.observation.recordLoss(1, uint64(lostBytes), uint64(priorInFlight), subtract(uint64(priorInFlight), uint64(lostBytes)))
-	m.observation.recordCongestionWindow(before, after)
+	m.observation.recordCongestionWindow(before, after, lostBytes > 0)
 }
 
 func (m *monitoredCongestionController) OnRetransmissionTimeout(packetsRetransmitted bool) {
@@ -67,7 +67,7 @@ func (m *monitoredCongestionControllerEx) OnCongestionEventEx(priorInFlight cong
 		bytesLost += uint64(packet.BytesLost)
 	}
 	m.observation.recordLoss(uint64(len(lostPackets)), bytesLost, uint64(priorInFlight), subtract(uint64(priorInFlight), bytesLost))
-	m.observation.recordCongestionWindow(before, after)
+	m.observation.recordCongestionWindow(before, after, len(lostPackets) > 0)
 }
 
 func subtract(value, amount uint64) uint64 {
