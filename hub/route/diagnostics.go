@@ -42,7 +42,7 @@ func diagnosticRouter() http.Handler {
 		}
 		for providerName, provider := range tunnel.Providers() {
 			for _, proxy := range provider.Proxies() {
-				if seen[proxy.Name()] {
+				if seen[proxy.Name()] || !diagnosticProxyType(proxy.Type()) {
 					continue
 				}
 				seen[proxy.Name()] = true
@@ -57,6 +57,15 @@ func diagnosticRouter() http.Handler {
 	r.Post("/runs", startDiagnostic)
 	r.Route("/runs/{id}", func(r chi.Router) { r.Get("/", getDiagnostic); r.Delete("/", cancelDiagnostic) })
 	return r
+}
+
+func diagnosticProxyType(value C.AdapterType) bool {
+	switch value {
+	case C.Direct, C.Reject, C.RejectDrop, C.Compatible, C.Pass, C.PassRule, C.Rematch, C.Dns, C.Relay, C.Selector, C.Fallback, C.URLTest, C.LoadBalance:
+		return false
+	default:
+		return true
+	}
 }
 
 func findDiagnosticProxy(name string) C.Proxy {
