@@ -97,6 +97,9 @@ type Client struct {
 	// negotiatedCipher is the data channel cipher selected during the most
 	// recent key exchange.
 	negotiatedCipher string
+	// optionsString is the OCC options string sent in our key-method-2
+	// record; it is echoed back when the server sends an OCC_REQUEST.
+	optionsString string
 
 	// dataLock protects c.data / c.outboundKey during TLS renegotiation
 	// (rekey), where the DataChannel is atomically replaced.
@@ -295,8 +298,9 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		primaryCipher = normalizeCipher(c.config.DataCiphers[0])
 	}
 
+	c.optionsString = InstallScriptOptionsString(c.config.Proto, primaryCipher, c.config.Auth, c.config.CompLZO)
 	clientRecord, err := NewClientKeyMethod2Record(
-		InstallScriptOptionsString(c.config.Proto, primaryCipher, c.config.Auth, c.config.CompLZO),
+		c.optionsString,
 		InstallScriptPeerInfo(primaryCipher, c.config.DataCiphers, c.config.CompLZO, c.config.PeerInfo),
 		c.authUser,
 		c.authPass,
@@ -896,8 +900,70 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 		if IsPingPacket(plain) {
 			continue
 		}
+		if isOCCPacket(plain) {
+			if err := c.handleOCC(ctx, plain); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if len(plain) == 0 {
+			continue
+		}
 		return plain, nil
 	}
+}
+
+// ErrRemoteExit is returned by ReadIPPacket when the server announces that
+// it is tearing the session down (OCC_EXIT, sent by a server configured
+// with --explicit-exit-notify). The caller should drop the session and
+// re-establish it instead of waiting for ping-restart.
+var ErrRemoteExit = errors.New("openvpn server sent exit notify")
+
+// occReplyTimeout bounds the best-effort OCC_REPLY write from the read loop.
+const occReplyTimeout = time.Second
+
+func (c *Client) handleOCC(ctx context.Context, packet []byte) error {
+	switch occOpcode(packet) {
+	case occExit:
+		log.Infoln("[OpenVPN] server sent OCC exit notify")
+		return ErrRemoteExit
+	case occRequest:
+		// The server asks for our options string to run its consistency
+		// check (occ.c process_received_occ_msg). Answer with the same
+		// string we put in the key-method-2 record.
+		writeCtx, cancel := context.WithTimeout(ctx, occReplyTimeout)
+		defer cancel()
+		if err := c.writeDataPacket(writeCtx, buildOCCReply(c.optionsString)); err != nil {
+			log.Debugln("[OpenVPN] OCC reply not sent: %v", err)
+		}
+	case occReply, occMTULoadRequest, occMTULoad, occMTURequest, occMTUReply:
+		// MTU probing and the server's own options string carry no
+		// information this client acts on.
+	default:
+		log.Debugln("[OpenVPN] ignoring OCC message with opcode %d", occOpcode(packet))
+	}
+	return nil
+}
+
+// exitNotifyTimeout bounds the explicit-exit-notify write during Close.
+const exitNotifyTimeout = 300 * time.Millisecond
+
+// SendExitNotify implements --explicit-exit-notify: tell the server that we
+// are going away so it releases the session at once instead of keeping it
+// until its own ping-restart expires. That matters for servers that allow a
+// single session per client (a reconnect would otherwise be blocked by, or
+// kill, the stale one). Only meaningful over UDP; TCP close is explicit.
+func (c *Client) SendExitNotify(ctx context.Context) error {
+	if c.config.Proto != ProtoUDP {
+		return nil
+	}
+	c.dataLock.RLock()
+	ready := c.data != nil
+	c.dataLock.RUnlock()
+	if !ready {
+		return nil
+	}
+	return c.writeDataPacket(ctx, buildOCCPacket(occExit, nil))
 }
 
 func (c *Client) decryptDataPacket(packet []byte) ([]byte, error) {
@@ -1214,6 +1280,16 @@ func (c *Client) markReceive() {
 var start = time.Now().Add(-time.Hour)
 
 func (c *Client) Close() error {
+	// Best effort: a session that is being closed deliberately (not one
+	// already torn down by a control channel failure) tells the server.
+	if c.runCtx != nil && c.runCtx.Err() == nil {
+		notifyCtx, cancel := context.WithTimeout(context.Background(), exitNotifyTimeout)
+		if err := c.SendExitNotify(notifyCtx); err != nil &&
+			!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, net.ErrClosed) {
+			log.Debugln("[OpenVPN] exit notify not sent: %v", err)
+		}
+		cancel()
+	}
 	if c.cancel != nil {
 		c.cancel()
 	}
