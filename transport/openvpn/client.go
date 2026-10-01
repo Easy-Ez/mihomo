@@ -373,10 +373,7 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		return push, nil
 	}
 
-	if _, err := c.tlsConn.Load().Write([]byte(PushRequest + "\x00")); err != nil {
-		return nil, fmt.Errorf("write push request: %w", err)
-	}
-	push, err := c.readPushReply(ctx)
+	push, err := c.requestPush(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1392,6 +1389,54 @@ func (c *Client) readServerKeyMethodFrom(ctx context.Context, conn pushReadConn)
 			}
 		}
 		readErr = err
+	}
+}
+
+// PushRequestInterval is how often PUSH_REQUEST is repeated while waiting
+// for PUSH_REPLY, mirroring PUSH_REQUEST_INTERVAL in the reference client.
+const PushRequestInterval = 5 * time.Second
+
+// requestPush sends PUSH_REQUEST and waits for the reply. A server may
+// legitimately take a while to answer (deferred authentication, a slow
+// client-connect script, load), and a single request can also be lost
+// before the TLS session settles, so the request is repeated every
+// PushRequestInterval until a reply or a terminal control message arrives.
+func (c *Client) requestPush(ctx context.Context) (*PushReply, error) {
+	conn := c.tlsConn.Load()
+	if _, err := conn.Write([]byte(PushRequest + "\x00")); err != nil {
+		return nil, fmt.Errorf("write push request: %w", err)
+	}
+	stop := repeatPushRequest(ctx, conn, PushRequestInterval)
+	defer stop()
+	return c.readPushReplyFrom(ctx, conn)
+}
+
+// repeatPushRequest rewrites PUSH_REQUEST every interval until stop is
+// called or ctx ends. tls.Conn permits a concurrent Read and Write, so the
+// repeat runs alongside the reply reader.
+func repeatPushRequest(ctx context.Context, w io.Writer, interval time.Duration) (stop func()) {
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := w.Write([]byte(PushRequest + "\x00")); err != nil {
+					log.Debugln("[OpenVPN] PUSH_REQUEST resend stopped: %v", err)
+					return
+				}
+				log.Debugln("[OpenVPN] PUSH_REPLY not received yet, resent PUSH_REQUEST")
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() { close(done) })
 	}
 }
 
