@@ -725,24 +725,45 @@ func (c *Client) captureAuthToken(push *PushReply) {
 }
 
 func (c *Client) WriteIPPacket(ctx context.Context, packet []byte) error {
-	return c.writeDataPacket(ctx, packet, true)
+	return c.writeDataPacket(ctx, packet)
 }
 
+// WritePing sends the OpenVPN keepalive. Like every other data channel
+// payload it goes through the compression framing (OpenVPN's ping is a
+// regular tunnel packet below the compression layer), so a comp-lzo server
+// can recognize it.
 func (c *Client) WritePing(ctx context.Context) error {
-	return c.writeDataPacket(ctx, openVPNPingPacket, false)
+	return c.writeDataPacket(ctx, openVPNPingPacket)
 }
 
-func (c *Client) writeDataPacket(ctx context.Context, packet []byte, compress bool) error {
+// frameOutbound applies the negotiated compression framing to a payload
+// about to be encrypted. The client never compresses; it only emits the
+// "not compressed" framing byte the server expects.
+func (c *Client) frameOutbound(packet []byte) ([]byte, error) {
+	if c.config.CompLZO == CompLzoYes {
+		return lzo1xCompressSafe(packet)
+	}
+	return packet, nil
+}
+
+// unframeInbound strips the compression framing from a decrypted payload
+// and decompresses it when the server compressed it. It runs before ping
+// detection because the server frames pings the same way.
+func (c *Client) unframeInbound(plain []byte) ([]byte, error) {
+	if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
+		return lzo1xDecompressSafe(plain)
+	}
+	return plain, nil
+}
+
+func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
 	if err := c.writeSem.Acquire(ctx, 1); err != nil {
 		return err
 	}
 	defer c.writeSem.Release(1)
-	if compress && c.config.CompLZO == CompLzoYes {
-		compressed, err := lzo1xCompressSafe(packet)
-		if err != nil {
-			return err
-		}
-		packet = compressed
+	packet, err := c.frameOutbound(packet)
+	if err != nil {
+		return err
 	}
 
 	// The no-evidence selection window is independent of AUTH_PENDING. The
@@ -868,11 +889,12 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 			continue
 		}
 		c.markReceive()
-		if IsPingPacket(plain) {
+		plain, err = c.unframeInbound(plain)
+		if err != nil {
 			continue
 		}
-		if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
-			return lzo1xDecompressSafe(plain)
+		if IsPingPacket(plain) {
+			continue
 		}
 		return plain, nil
 	}

@@ -759,7 +759,7 @@ func TestRekeyKeepsOldOutboundEvenIfNeverSent(t *testing.T) {
 	client.installDataChannel(rekeyed)
 
 	// Outbound must still be the old key (id 0) — not the new key.
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := serverIO.ReadPacket(context.Background())
@@ -822,7 +822,7 @@ func TestFailedDecryptDoesNotPromote(t *testing.T) {
 	}
 
 	// Outbound stays on the old key after the failed decrypt.
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := serverIO.ReadPacket(context.Background())
@@ -875,7 +875,7 @@ func TestOutboundPromotesAfterAuthDeferredExpire(t *testing.T) {
 	client.installDataChannel(rekeyed)
 
 	// Before the window elapses, outbound stays on the old key (no evidence).
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, _ := serverIO.ReadPacket(context.Background())
@@ -886,7 +886,7 @@ func TestOutboundPromotesAfterAuthDeferredExpire(t *testing.T) {
 	// Simulate the auth_deferred_expire window elapsing.
 	client.outboundStart = time.Now().Add(-authDeferredExpire - time.Second)
 
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, _ = serverIO.ReadPacket(context.Background())
@@ -949,7 +949,7 @@ func TestAuthPendingTimeoutDoesNotExtendOutboundSelection(t *testing.T) {
 
 	// AUTH_PENDING remains staged on the active epoch, but it must not extend
 	// old-key transmission beyond the independent selection window.
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := serverIO.ReadPacket(context.Background())
@@ -1069,7 +1069,7 @@ func TestRetiringExpiryForcesOutboundPromotion(t *testing.T) {
 	client.outboundStart = time.Now() // independent 60s window has not elapsed
 	client.dataLock.Unlock()
 
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := serverIO.ReadPacket(context.Background())
@@ -1670,7 +1670,7 @@ func TestOutboundKeyStaysLameDuckUntilPeerEvidence(t *testing.T) {
 	}
 	client.installDataChannel(initial)
 	// Activate the first epoch: outbound switches to it immediately.
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	// Drain that first packet.
@@ -1681,7 +1681,7 @@ func TestOutboundKeyStaysLameDuckUntilPeerEvidence(t *testing.T) {
 
 	// First outbound packet after the rekey must still use the old key ID 0
 	// (deferred auth: peer has not yet activated key ID 1).
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := serverIO.ReadPacket(context.Background())
@@ -1703,7 +1703,7 @@ func TestOutboundKeyStaysLameDuckUntilPeerEvidence(t *testing.T) {
 	}
 
 	// After evidence, outbound switches to key ID 1.
-	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false); err != nil {
+	if err := client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err = serverIO.ReadPacket(context.Background())
@@ -2911,7 +2911,7 @@ func TestExpiredPendingRetiringWindowPausesUntilInstall(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false)
+		writeDone <- client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20})
 	}()
 	select {
 	case err := <-writeDone:
@@ -2975,7 +2975,7 @@ func TestRetiringExpiryStagedBetweenSelectionAndEncryption(t *testing.T) {
 	key1.mu.Lock()
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false)
+		writeDone <- client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20})
 	}()
 	deadline := time.Now().Add(time.Second)
 	for client.dataLock.TryLock() {
@@ -3055,7 +3055,7 @@ func TestRetiringExpiryChangesBetweenSelectionAndEncryption(t *testing.T) {
 	key1.mu.Lock()
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20}, false)
+		writeDone <- client.writeDataPacket(context.Background(), []byte{0x45, 0, 0, 20})
 	}()
 	deadline := time.Now().Add(time.Second)
 	for client.dataLock.TryLock() {
