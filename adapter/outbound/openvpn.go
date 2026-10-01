@@ -56,6 +56,8 @@ type OpenVPNOption struct {
 	KeyDirection       string            `proxy:"key-direction,omitempty"`
 	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
 	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
+	VerifyX509Name     string            `proxy:"verify-x509-name,omitempty"`
+	VerifyX509NameType string            `proxy:"verify-x509-name-type,omitempty"`
 	Username           string            `proxy:"username,omitempty"`
 	Password           string            `proxy:"password,omitempty"`
 	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
@@ -114,6 +116,8 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
 		KeyDirection:        option.KeyDirection,
 		TLSCrypt:            []byte(option.TLSCrypt),
 		TLSCryptV2:          []byte(option.TLSCryptV2),
+		VerifyX509Name:      option.VerifyX509Name,
+		VerifyX509NameType:  option.VerifyX509NameType,
 		Username:            option.Username,
 		Password:            option.Password,
 		PeerInfo:            option.PeerInfo,

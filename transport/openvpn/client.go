@@ -1840,12 +1840,20 @@ func (c *Client) tlsConfig() (*tls.Config, error) {
 		for _, cert := range cs.PeerCertificates[1:] {
 			intermediates.AddCert(cert)
 		}
-		_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+		if _, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
 			Roots:         roots,
 			Intermediates: intermediates,
 			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		})
-		return err
+		}); err != nil {
+			return err
+		}
+		// OpenVPN verifies the chain plus the server EKU (remote-cert-tls
+		// server) without matching any hostname; --verify-x509-name adds a
+		// pin on the server certificate's name.
+		if c.config.VerifyX509Name != "" {
+			return verifyX509Name(cs.PeerCertificates[0], c.config.VerifyX509Name, c.config.VerifyX509NameType)
+		}
+		return nil
 	}
 	cfg := &tls.Config{
 		InsecureSkipVerify: true,

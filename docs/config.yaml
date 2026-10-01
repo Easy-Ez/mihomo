@@ -1484,6 +1484,8 @@ proxies: # socks5
     #   -----BEGIN OpenVPN tls-crypt-v2 client key-----
     #   AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8...
     #   -----END OpenVPN tls-crypt-v2 client key-----
+    # verify-x509-name: "server.example.com" # 可选：校验服务端证书名（对应 .ovpn 的 verify-x509-name）；不配置时仅校验证书链 + ServerAuth EKU，与 OpenVPN 默认一致
+    # verify-x509-name-type: name # name（默认，CN 精确匹配）/ name-prefix（CN 前缀）/ subject（完整 subject，格式如 "C=KG, ST=NA, O=Org, CN=Server-1"）
     # peer-info: # 透传给服务端的 peer-info 键值对，追加在内置 IV_VER/IV_PROTO/IV_CIPHERS 之后；用于服务端基于 peer-info 做准入决策
     #   IV_HWADDR: "52:54:00:ff:72:87"
     #   UV_DEVICE_ID: "laptop-001"
