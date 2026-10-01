@@ -3,6 +3,7 @@ package openvpn
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -167,5 +168,68 @@ func TestParseServerKeyMethod2RecordShortenedPreservesTail(t *testing.T) {
 	tail := packet[consumed:]
 	if !bytes.HasPrefix(tail, []byte("PUSH_REPLY")) {
 		t.Fatalf("expected leftover PUSH_REPLY, got %q", tail)
+	}
+}
+
+func TestInstallScriptPeerInfoCompressionModes(t *testing.T) {
+	cases := []struct {
+		mode    compressionMode
+		want    []string
+		exclude []string
+	}{
+		{compressNone, []string{"IV_COMP_STUB=0\n"}, []string{"IV_LZO=", "IV_COMP_STUB=1", "IV_LZO_STUB=", "IV_COMP_STUBv2="}},
+		{compressLZO, []string{"IV_LZO=1\n", "IV_COMP_STUB=0\n"}, []string{"IV_COMP_STUB=1"}},
+		{compressV1Stub, []string{"IV_COMP_STUB=1\n", "IV_LZO_STUB=1\n"}, []string{"IV_LZO=1", "IV_COMP_STUBv2="}},
+		{compressV2Stub, []string{"IV_COMP_STUBv2=1\n", "IV_COMP_STUB=1\n", "IV_LZO_STUB=1\n"}, []string{"IV_LZO=1"}},
+	}
+	for _, tc := range cases {
+		info := installScriptPeerInfo(CipherAES128GCM, nil, tc.mode, map[string]string{"IV_COMP_STUB": "0", "IV_HWADDR": "aa:bb"})
+		for _, want := range tc.want {
+			if !strings.Contains(info, want) {
+				t.Errorf("%v: missing %q in %q", tc.mode, want, info)
+			}
+		}
+		for _, exclude := range tc.exclude {
+			if strings.Contains(info, exclude) {
+				t.Errorf("%v: unexpected %q in %q", tc.mode, exclude, info)
+			}
+		}
+		if strings.Count(info, "IV_COMP_STUB=") > 1 {
+			t.Errorf("%v: user IV_COMP_STUB must not duplicate the built-in line: %q", tc.mode, info)
+		}
+		if !strings.Contains(info, "IV_HWADDR=aa:bb\n") {
+			t.Errorf("%v: user peer-info dropped: %q", tc.mode, info)
+		}
+	}
+	if !strings.Contains(installScriptOptions(ProtoUDP, CipherAES128GCM, AuthSHA256, compressV2Stub), "link-mtu 1544,tun-mtu 1500,proto UDPv4,comp-lzo,") {
+		t.Fatal("compress modes must advertise comp-lzo in the options string")
+	}
+	if strings.Contains(installScriptOptions(ProtoUDP, CipherAES128GCM, AuthSHA256, compressNone), "comp-lzo") {
+		t.Fatal("no compression must not advertise comp-lzo")
+	}
+}
+
+func TestConfigCompressOption(t *testing.T) {
+	base := func() *ClientConfig {
+		return &ClientConfig{RemoteHost: "vpn.example.com", RemotePort: 1194, CA: []byte(testCert), Username: "user"}
+	}
+	cfg := base()
+	cfg.Compress = " LZ4-V2 "
+	if err := cfg.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Compress != "lz4-v2" || cfg.compressMode != compressV2Stub {
+		t.Fatalf("compress = %q mode=%v", cfg.Compress, cfg.compressMode)
+	}
+	cfg = base()
+	cfg.CompLZO = "yes"
+	cfg.Compress = "stub"
+	if err := cfg.Prepare(); err == nil {
+		t.Fatal("comp-lzo and compress together must be rejected")
+	}
+	cfg = base()
+	cfg.Compress = "zstd"
+	if err := cfg.Prepare(); err == nil {
+		t.Fatal("unknown compress algorithm must be rejected")
 	}
 }

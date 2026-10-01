@@ -100,6 +100,10 @@ type Client struct {
 	// optionsString is the OCC options string sent in our key-method-2
 	// record; it is echoed back when the server sends an OCC_REQUEST.
 	optionsString string
+	// compressMode is the data channel framing in effect: the configured
+	// mode, replaced by a pushed compress / comp-lzo option during the
+	// initial handshake (before the packet loops start).
+	compressMode compressionMode
 
 	// dataLock protects c.data / c.outboundKey during TLS renegotiation
 	// (rekey), where the DataChannel is atomically replaced.
@@ -167,6 +171,7 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 		dataByKey:             make(map[uint8]*DataChannel),
 		dataChanged:           make(chan struct{}),
 		rekeyHandshakeTimeout: renegotiateTimeout,
+		compressMode:          config.compressMode,
 	}
 	client.markSend()
 	client.markReceive()
@@ -298,10 +303,10 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		primaryCipher = normalizeCipher(c.config.DataCiphers[0])
 	}
 
-	c.optionsString = InstallScriptOptionsString(c.config.Proto, primaryCipher, c.config.Auth, c.config.CompLZO)
+	c.optionsString = installScriptOptions(c.config.Proto, primaryCipher, c.config.Auth, c.config.compressMode)
 	clientRecord, err := NewClientKeyMethod2Record(
 		c.optionsString,
-		InstallScriptPeerInfo(primaryCipher, c.config.DataCiphers, c.config.CompLZO, c.config.PeerInfo),
+		installScriptPeerInfo(primaryCipher, c.config.DataCiphers, c.config.compressMode, c.config.PeerInfo),
 		c.authUser,
 		c.authPass,
 	)
@@ -384,6 +389,10 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		return nil, fmt.Errorf("openvpn push reply missing ifconfig address")
 	}
 	c.push = push
+	if mode, ok := pushedCompressionMode(push); ok && mode != c.compressMode {
+		log.Infoln("[OpenVPN] server pushed compression framing %v (configured %v)", mode, c.compressMode)
+		c.compressMode = mode
+	}
 
 	// Negotiate the data channel cipher based on the push reply.
 	negotiatedCipher, err := c.config.NegotiateCipher(push.DataCiphers, push.Cipher)
@@ -415,8 +424,8 @@ func (c *Client) logDataChannelReady(cipherName string, peerID uint32, keyID uin
 	if !isDataChannelAEAD(cipherName) {
 		mode = "CBC+" + c.config.Auth
 	}
-	log.Debugln("[OpenVPN] data channel ready: cipher=%s mode=%s peer-id=%d key-id=%d (configured cipher %s)",
-		cipherName, mode, peerID, keyID, c.config.Cipher)
+	log.Debugln("[OpenVPN] data channel ready: cipher=%s mode=%s compression=%v peer-id=%d key-id=%d (configured cipher %s)",
+		cipherName, mode, c.compressMode, peerID, keyID, c.config.Cipher)
 }
 
 // redactPushReply hides pushed credentials (auth-token / auth-token-user)
@@ -744,20 +753,17 @@ func (c *Client) WritePing(ctx context.Context) error {
 // about to be encrypted. The client never compresses; it only emits the
 // "not compressed" framing byte the server expects.
 func (c *Client) frameOutbound(packet []byte) ([]byte, error) {
-	if c.config.CompLZO == CompLzoYes {
-		return lzo1xCompressSafe(packet)
-	}
-	return packet, nil
+	return compressFrame(c.compressMode, packet), nil
 }
 
 // unframeInbound strips the compression framing from a decrypted payload
 // and decompresses it when the server compressed it. It runs before ping
 // detection because the server frames pings the same way.
 func (c *Client) unframeInbound(plain []byte) ([]byte, error) {
-	if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
-		return lzo1xDecompressSafe(plain)
+	if c.compressMode == compressNone || len(plain) == 0 {
+		return plain, nil
 	}
-	return plain, nil
+	return decompressFrame(c.compressMode, plain)
 }
 
 func (c *Client) writeDataPacket(ctx context.Context, packet []byte) error {
@@ -1807,6 +1813,12 @@ func mergePushReply(prev, next *PushReply) *PushReply {
 	}
 	if next.PingRestart == 0 {
 		next.PingRestart = prev.PingRestart
+	}
+	if !next.HasCompress && prev.HasCompress {
+		next.HasCompress, next.Compress = true, prev.Compress
+	}
+	if !next.HasCompLZO && prev.HasCompLZO {
+		next.HasCompLZO, next.CompLZO = true, prev.CompLZO
 	}
 	if !next.Redirect {
 		next.Redirect = prev.Redirect

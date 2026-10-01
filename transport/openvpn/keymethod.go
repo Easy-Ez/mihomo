@@ -248,7 +248,20 @@ func DeriveClientKeyMaterial(sources KeySource2, clientSession, serverSession Se
 	}, nil
 }
 
+// InstallScriptOptionsString builds the OCC options string for a comp-lzo
+// style configuration; compLZO is "yes" or "". See installScriptOptions.
 func InstallScriptOptionsString(proto, cipher, auth string, compLZO string) string {
+	mode := compressNone
+	if compLZO == CompLzoYes {
+		mode = compressLZO
+	}
+	return installScriptOptions(proto, cipher, auth, mode)
+}
+
+// installScriptOptions builds the OCC options string. OpenVPN advertises
+// any compression framing as "comp-lzo" here, whatever the algorithm
+// (options.c options_string), so every mode other than none emits it.
+func installScriptOptions(proto, cipher, auth string, mode compressionMode) string {
 	protoName := "UDPv4"
 	if proto == ProtoTCP {
 		protoName = "TCPv4_CLIENT"
@@ -259,22 +272,44 @@ func InstallScriptOptionsString(proto, cipher, auth string, compLZO string) stri
 	}
 	mtu := "1550"
 	comp := ""
-	if compLZO == CompLzoYes {
+	if mode != compressNone {
 		mtu = "1544"
 		comp = "comp-lzo,"
 	}
 	return fmt.Sprintf("V4,dev-type tun,link-mtu %s,tun-mtu 1500,proto %s,%scipher %s,auth %s,keysize %s,key-method 2,tls-client", mtu, protoName, comp, cipher, auth, keysize)
 }
 
+// InstallScriptPeerInfo builds the peer-info block for a comp-lzo style
+// configuration; compLZO is "yes" or "". See installScriptPeerInfo.
 func InstallScriptPeerInfo(cipher string, dataCiphers []string, compLZO string, peerInfo map[string]string) string {
+	mode := compressNone
+	if compLZO == CompLzoYes {
+		mode = compressLZO
+	}
+	return installScriptPeerInfo(cipher, dataCiphers, mode, peerInfo)
+}
+
+// compressionPeerInfo returns the IV_* capability lines for a framing mode,
+// matching what the reference client advertises (ssl.c push_peer_info).
+func compressionPeerInfo(mode compressionMode) string {
+	switch mode {
+	case compressLZO:
+		return "IV_LZO=1\n"
+	case compressV1Stub:
+		return "IV_COMP_STUB=1\nIV_LZO_STUB=1\n"
+	case compressV2Stub:
+		return "IV_COMP_STUBv2=1\nIV_COMP_STUB=1\nIV_LZO_STUB=1\n"
+	default:
+		return ""
+	}
+}
+
+func installScriptPeerInfo(cipher string, dataCiphers []string, mode compressionMode, peerInfo map[string]string) string {
 	ivVer := "mihomo-openvpn"
 	if value, ok := peerInfo["IV_VER"]; ok {
 		ivVer = value
 	}
-	lzo := ""
-	if compLZO == CompLzoYes {
-		lzo = "IV_LZO=1\n"
-	}
+	lzo := compressionPeerInfo(mode)
 	// Build the IV_CIPHERS string. If a data-ciphers list is configured,
 	// send all entries colon-separated. Otherwise, send just the single cipher.
 	ivCiphers := cipher
@@ -297,8 +332,8 @@ func InstallScriptPeerInfo(cipher string, dataCiphers []string, compLZO string, 
 		switch key {
 		case "IV_VER", "IV_PROTO", "IV_CIPHERS":
 			continue
-		case "IV_LZO":
-			if lzo != "" {
+		case "IV_LZO", "IV_LZO_STUB", "IV_COMP_STUB", "IV_COMP_STUBv2":
+			if strings.Contains(lzo, key+"=") {
 				continue
 			}
 		}

@@ -36,6 +36,15 @@ type PushReply struct {
 	Ping        time.Duration
 	PingRestart time.Duration
 
+	// Compression pushed by the server: "compress [alg]" sets HasCompress
+	// with the algorithm (empty for a bare "compress"), "comp-lzo [mode]"
+	// sets HasCompLZO. OpenVPN lets these override the client's own
+	// compression configuration.
+	Compress    string
+	HasCompress bool
+	CompLZO     string
+	HasCompLZO  bool
+
 	// AuthToken is the most recently pushed auth-token / auth-token-user
 	// pair. Empty when the server does not rotate credentials.
 	AuthTokenUser string
@@ -149,6 +158,16 @@ func parsePushReplyInner(message string) (*PushReply, error) {
 		case "ping-restart":
 			if len(fields) >= 2 {
 				reply.PingRestart = parsePushSeconds(fields[1])
+			}
+		case "compress":
+			reply.HasCompress = true
+			if len(fields) >= 2 {
+				reply.Compress = strings.ToLower(fields[1])
+			}
+		case "comp-lzo":
+			reply.HasCompLZO = true
+			if len(fields) >= 2 {
+				reply.CompLZO = strings.ToLower(fields[1])
 			}
 		case "data-ciphers", "ncp-ciphers":
 			if len(fields) >= 2 {

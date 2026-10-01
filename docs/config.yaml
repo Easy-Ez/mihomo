@@ -1447,7 +1447,8 @@ proxies: # socks5
     # data-ciphers: [AES-256-GCM, AES-128-GCM] # 数据通道 cipher 协商列表，发送 IV_CIPHERS 给服务端；服务端 push 的 cipher 列表与本地列表取交集，取第一个匹配项
     # data-ciphers-fallback: AES-128-CBC # 协商失败时的回退 cipher（对应 --data-ciphers-fallback）
     # auth: SHA256 # 支持 MD5 / SHA1 / SHA256 / SHA384 / SHA512，默认 SHA256；AEAD cipher 会忽略 auth
-    # comp-lzo: "no" # 可选值："yes", "no", "adaptive"
+    # comp-lzo: "no" # 旧式压缩框架，可选值："yes", "no", "adaptive"；与 compress 互斥。客户端从不压缩，"yes"/"adaptive" 只是按 comp-lzo 框架收发并解压服务端数据；服务端为 comp-lzo no 时客户端也填 "yes"
+    # compress: stub-v2 # 新式压缩框架（对应 .ovpn 的 compress），可选值：stub / stub-v2 / lzo / lz4 / lz4-v2；与 comp-lzo 互斥。服务端 push 的 compress / comp-lzo 会覆盖本地配置
     # username / password: auth-user-pass 模式（与下方 cert+key 二选一，不能都不填）
     # username: "user"
     # password: "pass"

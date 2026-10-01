@@ -48,6 +48,12 @@ type ClientConfig struct {
 	Cipher     string
 	Auth       string
 	CompLZO    string
+	// Compress is the --compress algorithm: "", stub, stub-v2, lzo, lz4 or
+	// lz4-v2. Mutually exclusive with CompLZO. The client never compresses;
+	// the value only selects the data channel framing.
+	Compress string
+	// compressMode is the framing resolved from CompLZO / Compress by Prepare.
+	compressMode compressionMode
 
 	CA       []byte
 	Cert     []byte
@@ -259,6 +265,12 @@ func (c *ClientConfig) Prepare() error {
 	c.Cipher = normalizeCipher(c.Cipher)
 	c.Auth = normalizeAuth(c.Auth)
 	c.CompLZO = normalizeCompLZO(c.CompLZO)
+	c.Compress = strings.ToLower(strings.TrimSpace(c.Compress))
+	mode, err := resolveCompressionMode(c.CompLZO, c.Compress)
+	if err != nil {
+		return err
+	}
+	c.compressMode = mode
 	c.VerifyX509Name = strings.TrimSpace(c.VerifyX509Name)
 	c.VerifyX509NameType = normalizeVerifyX509NameType(c.VerifyX509NameType)
 

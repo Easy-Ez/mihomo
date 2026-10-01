@@ -86,3 +86,39 @@ func TestMergePushReplyKeepsKeepalive(t *testing.T) {
 		t.Fatalf("merged keepalive = %s/%s, want 10s/1m0s", merged.Ping, merged.PingRestart)
 	}
 }
+
+func TestParsePushReplyCompression(t *testing.T) {
+	reply, err := ParsePushReply("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,compress stub-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.HasCompress || reply.Compress != "stub-v2" || reply.HasCompLZO {
+		t.Fatalf("compress push = %+v", reply)
+	}
+	reply, err = ParsePushReply("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,comp-lzo no")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.HasCompLZO || reply.CompLZO != "no" || reply.HasCompress {
+		t.Fatalf("comp-lzo push = %+v", reply)
+	}
+	reply, err = ParsePushReply("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,compress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.HasCompress || reply.Compress != "" {
+		t.Fatalf("bare compress push = %+v", reply)
+	}
+	if len(reply.Unknown) != 0 {
+		t.Fatalf("compression options must not be reported as unknown: %v", reply.Unknown)
+	}
+}
+
+func TestMergePushReplyKeepsCompression(t *testing.T) {
+	first, _ := parsePushReplyInner("PUSH_REPLY,compress lz4-v2,push-continuation 2")
+	second, _ := parsePushReplyInner("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,push-continuation 1")
+	merged := mergePushReply(first, second)
+	if !merged.HasCompress || merged.Compress != "lz4-v2" {
+		t.Fatalf("merged compression = %+v", merged)
+	}
+}
