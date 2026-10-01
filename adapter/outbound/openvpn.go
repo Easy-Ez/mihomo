@@ -323,12 +323,16 @@ func (o *OpenVPN) startLocked(handshakeCtx context.Context) (ipStack, resolver.R
 		_ = packetIO.Close()
 		return nil, nil, err
 	}
+	handshakeStart := time.Now()
+	log.Debugln("[OpenVPN](%s) handshake started: %s %s", o.name, o.config.Proto, o.addr)
 	push, err := client.Handshake(handshakeCtx)
 	if err != nil {
 		_ = client.Close()
+		log.Warnln("[OpenVPN](%s) handshake failed after %s: %v", o.name, time.Since(handshakeStart).Round(time.Millisecond), err)
 		return nil, nil, fmt.Errorf("make OpenVPN handshake: %w", err)
 	}
-	log.Debugln("[OpenVPN](%s) handshake complete: prefixes=%v routes=%v peer-id=%d dns=%v redirect=%t block-ipv6=%t", o.name, push.Prefixes, push.Routes, push.PeerID, push.DNS, push.Redirect, push.BlockIPv6)
+	log.Debugln("[OpenVPN](%s) handshake complete in %s: prefixes=%v routes=%v peer-id=%d dns=%v redirect=%t block-ipv6=%t",
+		o.name, time.Since(handshakeStart).Round(time.Millisecond), push.Prefixes, push.Routes, push.PeerID, push.DNS, push.Redirect, push.BlockIPv6)
 
 	mtu := o.option.MTU
 	if mtu == 0 {
@@ -406,6 +410,9 @@ func (o *OpenVPN) startPacketLoops() {
 				o.running = false
 			}
 			o.runLock.Release(1)
+			if o.runCtx.Err() == nil {
+				log.Infoln("[OpenVPN](%s) session closed, will re-establish on next dial", o.name)
+			}
 		})
 	}
 	go func() {

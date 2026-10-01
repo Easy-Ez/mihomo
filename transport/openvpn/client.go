@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/contextutils"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/tls"
 	"golang.org/x/sync/semaphore"
 )
@@ -118,25 +119,30 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 		return nil, errors.New("nil openvpn packet io")
 	}
 	var crypt ControlCryptor
+	protection := "none (plaintext)"
 	if len(config.TLSCryptV2Key) > 0 || len(config.TLSCryptV2WrappedKey) > 0 {
 		var err error
 		crypt, err = NewTLSCryptV2(config.TLSCryptV2Key, config.TLSCryptV2WrappedKey)
 		if err != nil {
 			return nil, err
 		}
+		protection = "tls-crypt-v2"
 	} else if len(config.TLSCryptKey) > 0 {
 		var err error
 		crypt, err = NewTLSCrypt(config.TLSCryptKey, true)
 		if err != nil {
 			return nil, err
 		}
+		protection = "tls-crypt"
 	} else if len(config.TLSAuthKey) > 0 {
 		var err error
 		crypt, err = NewTLSAuth(config.TLSAuthKey, config.KeyDirection, config.Auth)
 		if err != nil {
 			return nil, err
 		}
+		protection = fmt.Sprintf("tls-auth (auth=%s, key-direction=%q)", config.Auth, config.KeyDirection)
 	}
+	log.Debugln("[OpenVPN] control channel protection: %s", protection)
 	local, err := NewSessionID()
 	if err != nil {
 		return nil, err
@@ -257,6 +263,9 @@ func (c *Client) startTLSEpoch(ctx context.Context) (interrupt func(), err error
 		interrupt()
 		return nil, fmt.Errorf("openvpn tls handshake: %w", err)
 	}
+	state := conn.ConnectionState()
+	log.Debugln("[OpenVPN] TLS established: version=%s cipher-suite=%s key-id=%d",
+		tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite), c.control.KeyID())
 	// Drain any control packets that arrived on the new epoch while the
 	// handshake was reading, so they are not acknowledged and dropped by a
 	// raw ControlChannel read. A TLS-encrypted P_CONTROL_V1 token update
@@ -306,6 +315,10 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Debugln("[OpenVPN] server options: %s", serverRecord.Options)
+	if serverRecord.PeerInfo != "" {
+		log.Debugln("[OpenVPN] server peer-info: %q", serverRecord.PeerInfo)
+	}
 
 	// Derive keys using the maximum cipher key length (32 bytes). The actual
 	// cipher is determined after the push reply, and keys are sliced to the
@@ -345,6 +358,7 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 			return nil, err
 		}
 		c.installDataChannel(newData)
+		c.logDataChannelReady(negotiatedCipher, push.PeerID, keyID)
 		c.markSend()
 		c.markReceive()
 		return push, nil
@@ -358,6 +372,10 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 	push = mergePushReply(c.push, push)
+	log.Debugln("[OpenVPN] PUSH_REPLY: %s", redactPushReply(push.Raw))
+	if len(push.Unknown) > 0 {
+		log.Debugln("[OpenVPN] pushed options not applied: %s", strings.Join(push.Unknown, ", "))
+	}
 	if len(push.Prefixes) == 0 {
 		return nil, fmt.Errorf("openvpn push reply missing ifconfig address")
 	}
@@ -381,10 +399,41 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 	c.installDataChannel(newData)
+	c.logDataChannelReady(negotiatedCipher, push.PeerID, keyID)
 	c.captureAuthToken(push)
 	c.markSend()
 	c.markReceive()
 	return push, nil
+}
+
+func (c *Client) logDataChannelReady(cipherName string, peerID uint32, keyID uint8) {
+	mode := "AEAD"
+	if !isDataChannelAEAD(cipherName) {
+		mode = "CBC+" + c.config.Auth
+	}
+	log.Debugln("[OpenVPN] data channel ready: cipher=%s mode=%s peer-id=%d key-id=%d (configured cipher %s)",
+		cipherName, mode, peerID, keyID, c.config.Cipher)
+}
+
+// redactPushReply hides pushed credentials (auth-token / auth-token-user)
+// so a PUSH_REPLY can be logged without leaking a session token.
+func redactPushReply(raw string) string {
+	raw = strings.TrimRight(raw, "\x00")
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, ",")
+	for i, part := range parts {
+		fields := strings.Fields(part)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "auth-token", "auth-token-user":
+			parts[i] = fields[0] + " <redacted>"
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 // consumeRekeyPush updates the cached push state after an authenticated
@@ -907,6 +956,10 @@ func (c *Client) watchControl() {
 		// OpenVPN starts the retiring (lame-duck) key lifetime when it accepts
 		// the soft reset. Capture that absolute deadline before probing the old
 		// TLS epoch; the optional token probe may consume tokenPushReadTimeout.
+		rekeyStart := time.Now()
+		if packet != nil {
+			log.Debugln("[OpenVPN] key renegotiation started by server (new key-id %d)", packet.KeyID&KeyIDMask)
+		}
 		retiringExpiry := c.retiringWindowDeadline(packet)
 		c.stageRetiringWindow(retiringExpiry)
 		// Token-only PUSH_REPLY parked since the last rekey must land in
@@ -934,11 +987,15 @@ func (c *Client) watchControl() {
 			}
 			return
 		}
+		log.Debugln("[OpenVPN] key renegotiation complete (key-id %d) in %s",
+			c.control.KeyID(), time.Since(rekeyStart).Round(time.Millisecond))
 	}
 }
 
 func (c *Client) failControl(err error) {
-	c.lastRekeyErr.CompareAndSwap(nil, &err)
+	if c.lastRekeyErr.CompareAndSwap(nil, &err) {
+		log.Warnln("[OpenVPN] control channel failed, closing session: %v", err)
+	}
 	c.cancel()
 	_ = c.mux.Close()
 }
@@ -1640,6 +1697,7 @@ func mergePushReply(prev, next *PushReply) *PushReply {
 	next.DNS = appendUniqueAddrs(prev.DNS, next.DNS)
 	nextHasPushReply := next.HasPushReply
 	next.DataCiphers = appendUniqueStrings(prev.DataCiphers, next.DataCiphers)
+	next.Unknown = appendUniqueStrings(prev.Unknown, next.Unknown)
 	if next.PeerID == PeerIDUnset {
 		next.PeerID = prev.PeerID
 	}

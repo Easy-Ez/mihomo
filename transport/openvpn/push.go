@@ -52,6 +52,10 @@ type PushReply struct {
 	// hasAuthPending distinguishes an explicit timeout of zero from no
 	// AUTH_PENDING message.
 	hasAuthPending bool
+
+	// Unknown lists pushed options this client parsed but does not act on,
+	// so the connection log can show what a server relies on that is ignored.
+	Unknown []string
 }
 
 func ParsePushReply(message string) (*PushReply, error) {
@@ -165,6 +169,8 @@ func parsePushReplyInner(message string) (*PushReply, error) {
 				return nil, fmt.Errorf("invalid push-continuation %q", fields[1])
 			}
 			reply.PushContinuation = n
+		default:
+			reply.Unknown = append(reply.Unknown, option)
 		}
 	}
 	return reply, nil
