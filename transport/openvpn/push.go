@@ -29,6 +29,13 @@ type PushReply struct {
 	// option (legacy or fallback).
 	Cipher string
 
+	// Ping and PingRestart are the keepalive parameters pushed by the server
+	// ("ping N" / "ping-restart N", usually from its --keepalive). Zero when
+	// the server did not push them. OpenVPN lets pushed values override the
+	// client's local configuration.
+	Ping        time.Duration
+	PingRestart time.Duration
+
 	// AuthToken is the most recently pushed auth-token / auth-token-user
 	// pair. Empty when the server does not rotate credentials.
 	AuthTokenUser string
@@ -135,6 +142,14 @@ func parsePushReplyInner(message string) (*PushReply, error) {
 			reply.Redirect = true
 		case "block-ipv6":
 			reply.BlockIPv6 = true
+		case "ping":
+			if len(fields) >= 2 {
+				reply.Ping = parsePushSeconds(fields[1])
+			}
+		case "ping-restart":
+			if len(fields) >= 2 {
+				reply.PingRestart = parsePushSeconds(fields[1])
+			}
 		case "data-ciphers", "ncp-ciphers":
 			if len(fields) >= 2 {
 				for _, c := range strings.Split(fields[1], ":") {
@@ -174,6 +189,17 @@ func parsePushReplyInner(message string) (*PushReply, error) {
 		}
 	}
 	return reply, nil
+}
+
+// parsePushSeconds parses a pushed interval in seconds. Invalid or
+// non-positive values are ignored (zero), matching how OpenVPN rejects a
+// bad "ping"/"ping-restart" argument instead of failing the connection.
+func parsePushSeconds(value string) time.Duration {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 32)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (p *PushReply) AuthToken() (user, pass string, ok bool) {

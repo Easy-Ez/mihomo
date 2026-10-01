@@ -3,6 +3,7 @@ package openvpn
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParsePushReplyRecordsUnknownOptions(t *testing.T) {
@@ -47,5 +48,41 @@ func TestRedactPushReply(t *testing.T) {
 	}
 	if redactPushReply("") != "" {
 		t.Fatal("empty input must stay empty")
+	}
+}
+
+func TestParsePushReplyKeepalive(t *testing.T) {
+	reply, err := ParsePushReply("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,ping 10,ping-restart 120,peer-id 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Ping != 10*time.Second || reply.PingRestart != 120*time.Second {
+		t.Fatalf("keepalive = %s/%s, want 10s/2m0s", reply.Ping, reply.PingRestart)
+	}
+	if len(reply.Unknown) != 0 {
+		t.Fatalf("keepalive options must not be reported as unknown: %v", reply.Unknown)
+	}
+
+	reply, err = ParsePushReply("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,ping abc,ping-restart -5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Ping != 0 || reply.PingRestart != 0 {
+		t.Fatalf("invalid keepalive values must be ignored, got %s/%s", reply.Ping, reply.PingRestart)
+	}
+}
+
+func TestMergePushReplyKeepsKeepalive(t *testing.T) {
+	first, err := parsePushReplyInner("PUSH_REPLY,ping 10,ping-restart 60,push-continuation 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := parsePushReplyInner("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,push-continuation 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergePushReply(first, second)
+	if merged.Ping != 10*time.Second || merged.PingRestart != 60*time.Second {
+		t.Fatalf("merged keepalive = %s/%s, want 10s/1m0s", merged.Ping, merged.PingRestart)
 	}
 }

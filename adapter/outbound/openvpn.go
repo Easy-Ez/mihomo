@@ -331,8 +331,10 @@ func (o *OpenVPN) startLocked(handshakeCtx context.Context) (ipStack, resolver.R
 		log.Warnln("[OpenVPN](%s) handshake failed after %s: %v", o.name, time.Since(handshakeStart).Round(time.Millisecond), err)
 		return nil, nil, fmt.Errorf("make OpenVPN handshake: %w", err)
 	}
-	log.Debugln("[OpenVPN](%s) handshake complete in %s: prefixes=%v routes=%v peer-id=%d dns=%v redirect=%t block-ipv6=%t",
-		o.name, time.Since(handshakeStart).Round(time.Millisecond), push.Prefixes, push.Routes, push.PeerID, push.DNS, push.Redirect, push.BlockIPv6)
+	pingInterval, pingRestart, keepaliveSource := openVPNKeepalive(o.config, push)
+	log.Debugln("[OpenVPN](%s) handshake complete in %s: prefixes=%v routes=%v peer-id=%d dns=%v redirect=%t block-ipv6=%t ping=%s ping-restart=%s (%s)",
+		o.name, time.Since(handshakeStart).Round(time.Millisecond), push.Prefixes, push.Routes, push.PeerID, push.DNS, push.Redirect, push.BlockIPv6,
+		pingInterval, pingRestart, keepaliveSource)
 
 	mtu := o.option.MTU
 	if mtu == 0 {
@@ -361,8 +363,35 @@ func (o *OpenVPN) startLocked(handshakeCtx context.Context) (ipStack, resolver.R
 			IPv6: openVPNPrefixesHas6(push.Prefixes),
 		})
 	}
-	o.startPacketLoops()
+	o.startPacketLoops(pingInterval, pingRestart)
 	return o.tunDevice, o.resolver, nil
+}
+
+// openVPNKeepalive returns the effective keepalive parameters for a session.
+// Values pushed by the server (its --keepalive, delivered as "ping N" and
+// "ping-restart N" in PUSH_REPLY) override the local configuration, as in
+// the reference client; the local values are the fallback when the server
+// pushes nothing. The returned label says where each value came from.
+func openVPNKeepalive(config *ovpn.ClientConfig, push *ovpn.PushReply) (pingInterval, pingRestart time.Duration, source string) {
+	pingInterval = config.PingInterval
+	pingRestart = config.PingRestart
+	pingSource, restartSource := "config", "config"
+	if push != nil {
+		if push.Ping > 0 {
+			pingInterval = push.Ping
+			pingSource = "pushed"
+		}
+		if push.PingRestart > 0 {
+			pingRestart = push.PingRestart
+			restartSource = "pushed"
+		}
+	}
+	if pingSource == restartSource {
+		source = pingSource
+	} else {
+		source = "ping " + pingSource + ", ping-restart " + restartSource
+	}
+	return pingInterval, pingRestart, source
 }
 
 func openVPNPrefixesHas6(prefixes []netip.Prefix) bool {
@@ -393,7 +422,7 @@ func (o *OpenVPN) openPacketIO(ctx context.Context) (ovpn.PacketIO, error) {
 	}
 }
 
-func (o *OpenVPN) startPacketLoops() {
+func (o *OpenVPN) startPacketLoops(pingInterval, pingRestart time.Duration) {
 	runCtx, runCancel := context.WithCancel(o.runCtx)
 	client := o.client
 	tunDevice := o.tunDevice
@@ -458,15 +487,15 @@ func (o *OpenVPN) startPacketLoops() {
 		}
 	}()
 
-	if o.config.PingInterval > 0 {
+	if pingInterval > 0 {
 		go func() {
 			defer stop()
-			ticker := time.NewTicker(o.config.PingInterval)
+			ticker := time.NewTicker(pingInterval)
 			defer ticker.Stop()
 			for runCtx.Err() == nil {
 				select {
 				case <-ticker.C:
-					if sinceSend := client.SinceSend(); sinceSend >= o.config.PingInterval {
+					if sinceSend := client.SinceSend(); sinceSend >= pingInterval {
 						if err := client.WritePing(runCtx); err != nil {
 							if !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
 								log.Warnln("[OpenVPN](%s) error writing ping packet: %v", o.name, err)
@@ -482,15 +511,15 @@ func (o *OpenVPN) startPacketLoops() {
 		}()
 	}
 
-	if o.config.PingRestart > 0 {
+	if pingRestart > 0 {
 		go func() {
 			defer stop()
-			ticker := time.NewTicker(o.config.PingRestart)
+			ticker := time.NewTicker(pingRestart)
 			defer ticker.Stop()
 			for runCtx.Err() == nil {
 				select {
 				case <-ticker.C:
-					if sinceReceive := client.SinceReceive(); sinceReceive >= o.config.PingRestart {
+					if sinceReceive := client.SinceReceive(); sinceReceive >= pingRestart {
 						log.Warnln(
 							"[OpenVPN](%s) ping-restart timeout: no packet received for %s",
 							o.name,

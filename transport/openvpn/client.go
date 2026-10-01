@@ -1726,6 +1726,12 @@ func mergePushReply(prev, next *PushReply) *PushReply {
 	if next.Cipher == "" {
 		next.Cipher = prev.Cipher
 	}
+	if next.Ping == 0 {
+		next.Ping = prev.Ping
+	}
+	if next.PingRestart == 0 {
+		next.PingRestart = prev.PingRestart
+	}
 	if !next.Redirect {
 		next.Redirect = prev.Redirect
 	}

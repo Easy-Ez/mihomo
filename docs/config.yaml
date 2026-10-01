@@ -1487,8 +1487,8 @@ proxies: # socks5
     # peer-info: # 透传给服务端的 peer-info 键值对，追加在内置 IV_VER/IV_PROTO/IV_CIPHERS 之后；用于服务端基于 peer-info 做准入决策
     #   IV_HWADDR: "52:54:00:ff:72:87"
     #   UV_DEVICE_ID: "laptop-001"
-    # ping: 10 # 默认值为 0
-    # ping-restart: 60 # 默认值为 0
+    # ping: 10 # 保活间隔（秒）；服务端 push 的 ping 会覆盖此值，未配置且服务端未 push 时不发保活，默认值为 0
+    # ping-restart: 60 # 多久收不到服务端数据就重建会话（秒）；服务端 push 的 ping-restart 会覆盖此值，默认值为 0 表示不检测
     # tran-window: 3600 # 旧 data key 在 rekey 后保留的秒数；默认 3600，显式设为 0 表示立即过期，应与服务端 --tran-window 对齐
     # handshake-timeout: 30 # 单位为秒；配置后握手时不受外层连接超时影响；默认值为 0，表示仅使用外层连接超时
     # mtu: 1500
