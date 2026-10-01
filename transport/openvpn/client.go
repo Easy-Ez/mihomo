@@ -100,6 +100,10 @@ type Client struct {
 	// optionsString is the OCC options string sent in our key-method-2
 	// record; it is echoed back when the server sends an OCC_REQUEST.
 	optionsString string
+	// serverAuth is the HMAC digest the server declared in its key-method-2
+	// options string. --auth is not negotiated, so a CBC data channel must
+	// use the server's digest; AEAD ciphers ignore it.
+	serverAuth string
 	// compressMode is the data channel framing in effect: the configured
 	// mode, replaced by a pushed compress / comp-lzo option during the
 	// initial handshake (before the packet loops start).
@@ -328,6 +332,7 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 	if serverRecord.PeerInfo != "" {
 		log.Debugln("[OpenVPN] server peer-info: %q", serverRecord.PeerInfo)
 	}
+	c.adoptServerOptions(serverRecord.Options)
 
 	// Derive keys using the maximum cipher key length (32 bytes). The actual
 	// cipher is determined after the push reply, and keys are sliced to the
@@ -362,7 +367,7 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 		keys.SendCipherKey = keys.SendCipherKey[:cipherKeyLen]
 		keys.RecvCipherKey = keys.RecvCipherKey[:cipherKeyLen]
 		keyID := c.control.KeyID()
-		newData, err := NewDataChannel(keys, negotiatedCipher, c.config.Auth, push.PeerID, keyID)
+		newData, err := NewDataChannel(keys, negotiatedCipher, c.effectiveAuth(negotiatedCipher), push.PeerID, keyID)
 		if err != nil {
 			return nil, err
 		}
@@ -404,7 +409,7 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 	keys.RecvCipherKey = keys.RecvCipherKey[:cipherKeyLen]
 
 	keyID := c.control.KeyID()
-	newData, err := NewDataChannel(keys, negotiatedCipher, c.config.Auth, push.PeerID, keyID)
+	newData, err := NewDataChannel(keys, negotiatedCipher, c.effectiveAuth(negotiatedCipher), push.PeerID, keyID)
 	if err != nil {
 		return nil, err
 	}
@@ -416,10 +421,76 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 	return push, nil
 }
 
+// adoptServerOptions inspects the server's key-method-2 options string
+// ("V4,dev-type tun,...,cipher X,auth Y,...") and records the digest the
+// server runs its data channel HMAC with. --auth is not part of NCP, so a
+// CBC session only works when both sides use the same digest; the server's
+// declaration is authoritative. The cipher is only logged: NCP decides it.
+func (c *Client) adoptServerOptions(options string) {
+	opts := parseOCCOptions(options)
+	if serverCipher, ok := opts["cipher"]; ok && normalizeCipher(serverCipher) != c.config.Cipher {
+		log.Debugln("[OpenVPN] server options cipher %s differs from configured %s; the pushed cipher decides", serverCipher, c.config.Cipher)
+	}
+	serverAuth, ok := opts["auth"]
+	if !ok {
+		return
+	}
+	normalized := normalizeAuth(serverAuth)
+	if !isSupportedAuth(normalized) {
+		// A server whose default data cipher is AEAD reports "[null-digest]"
+		// here; it still applies its configured --auth when it falls back to
+		// a CBC cipher for us, so this is informational, not a mismatch.
+		if serverCipher, ok := opts["cipher"]; ok && isDataChannelAEAD(normalizeCipher(serverCipher)) {
+			log.Debugln("[OpenVPN] server options auth %q (AEAD default), keeping configured %s for CBC ciphers", serverAuth, c.config.Auth)
+		} else {
+			log.Warnln("[OpenVPN] server options auth %q is not supported, keeping configured %s for CBC ciphers", serverAuth, c.config.Auth)
+		}
+		return
+	}
+	if normalized != c.config.Auth {
+		log.Infoln("[OpenVPN] server options auth %s differs from configured %s; CBC data channel will use %s", normalized, c.config.Auth, normalized)
+	}
+	c.serverAuth = normalized
+}
+
+// effectiveAuth returns the HMAC digest for the data channel: the server's
+// declared digest for CBC ciphers when known, otherwise the configured one.
+// AEAD ciphers carry their own tag and ignore the value.
+func (c *Client) effectiveAuth(cipherName string) string {
+	if isDataChannelAEAD(cipherName) || c.serverAuth == "" {
+		return c.config.Auth
+	}
+	return c.serverAuth
+}
+
+// parseOCCOptions splits an OCC options string into a map keyed by the
+// first token of each comma-separated field ("cipher AES-256-CBC" ->
+// cipher: AES-256-CBC). Fields without a value (V4, tls-server) map to "".
+func parseOCCOptions(options string) map[string]string {
+	out := make(map[string]string)
+	for _, field := range strings.Split(options, ",") {
+		parts := strings.Fields(field)
+		if len(parts) == 0 {
+			continue
+		}
+		out[parts[0]] = strings.Join(parts[1:], " ")
+	}
+	return out
+}
+
+func isSupportedAuth(auth string) bool {
+	switch auth {
+	case AuthMD5, AuthSHA1, AuthSHA256, AuthSHA384, AuthSHA512:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Client) logDataChannelReady(cipherName string, peerID uint32, keyID uint8) {
 	mode := "AEAD"
 	if !isDataChannelAEAD(cipherName) {
-		mode = "CBC+" + c.config.Auth
+		mode = "CBC+" + c.effectiveAuth(cipherName)
 	}
 	log.Debugln("[OpenVPN] data channel ready: cipher=%s mode=%s compression=%v peer-id=%d key-id=%d (configured cipher %s)",
 		cipherName, mode, c.compressMode, peerID, keyID, c.config.Cipher)
