@@ -75,13 +75,16 @@ func (m *Manager) execute(ctx context.Context, id string, dialer C.Dialer, reque
 	var summary Summary
 	var samples []Sample
 	var err error
+	emit := func(sample Sample) {
+		m.appendSample(id, sample)
+	}
 	switch request.Profile {
 	case ProfileGame:
-		summary, samples, err = runGame(ctx, dialer, request)
+		summary, samples, err = runGame(ctx, dialer, request, emit)
 	case ProfileWeb:
-		summary, samples, err = runWeb(ctx, dialer, request)
+		summary, samples, err = runWeb(ctx, dialer, request, emit)
 	case ProfileVideo:
-		summary, samples, err = runVideo(ctx, dialer, request)
+		summary, samples, err = runVideo(ctx, dialer, request, emit)
 	}
 	now := time.Now().UTC()
 	m.mu.Lock()
@@ -102,6 +105,14 @@ func (m *Manager) execute(ctx context.Context, id string, dialer C.Dialer, reque
 		run.State = "completed"
 	}
 	m.active--
+}
+
+func (m *Manager) appendSample(id string, sample Sample) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if run := m.runs[id]; run != nil && run.State == "running" {
+		run.Samples = append(run.Samples, sample)
+	}
 }
 
 func (m *Manager) Get(id string) (Run, error) {

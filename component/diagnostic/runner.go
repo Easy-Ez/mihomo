@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -24,7 +25,16 @@ const (
 	udpHeaderSize = 56
 )
 
-func runGame(ctx context.Context, dialer C.Dialer, request StartRequest) (Summary, []Sample, error) {
+type sampleEmitter func(Sample)
+
+func emitSample(samples *[]Sample, sample Sample, emit sampleEmitter) {
+	*samples = append(*samples, sample)
+	if emit != nil {
+		emit(sample)
+	}
+}
+
+func runGame(ctx context.Context, dialer C.Dialer, request StartRequest, emit sampleEmitter) (Summary, []Sample, error) {
 	ip, _ := netip.ParseAddr(request.Target)
 	remote := netip.AddrPortFrom(ip.Unmap(), request.Port)
 	pc, err := dialer.ListenPacket(ctx, "udp", "", remote)
@@ -41,6 +51,7 @@ func runGame(ctx context.Context, dialer C.Dialer, request StartRequest) (Summar
 	sentAt, received := map[uint32]time.Time{}, map[uint32]bool{}
 	samples := make([]Sample, 0, int(duration/interval)+1)
 	readDone := make(chan error, 1)
+	readStop := make(chan struct{})
 	go func() {
 		buffer := make([]byte, 64<<10)
 		for {
@@ -49,6 +60,9 @@ func runGame(ctx context.Context, dialer C.Dialer, request StartRequest) (Summar
 			if readErr != nil {
 				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
 					select {
+					case <-readStop:
+						readDone <- nil
+						return
 					case <-ctx.Done():
 						readDone <- ctx.Err()
 						return
@@ -59,6 +73,12 @@ func runGame(ctx context.Context, dialer C.Dialer, request StartRequest) (Summar
 						return
 					}
 					continue
+				}
+				select {
+				case <-readStop:
+					readDone <- nil
+					return
+				default:
 				}
 				readDone <- readErr
 				return
@@ -74,11 +94,30 @@ func runGame(ctx context.Context, dialer C.Dialer, request StartRequest) (Summar
 			sent, ok := sentAt[seq]
 			if ok && !received[seq] {
 				received[seq] = true
-				samples = append(samples, Sample{Sequence: int64(seq), AtMs: float64(time.Since(started).Microseconds()) / 1000, Success: true, LatencyMs: float64(time.Since(sent).Microseconds()) / 1000, Bytes: int64(n)})
+				emitSample(&samples, Sample{Sequence: int64(seq), AtMs: float64(time.Since(started).Microseconds()) / 1000, Success: true, LatencyMs: float64(time.Since(sent).Microseconds()) / 1000, Bytes: int64(n)}, emit)
 			}
 			mu.Unlock()
 		}
 	}()
+	readerStopped := false
+	stopReader := func() error {
+		if readerStopped {
+			return nil
+		}
+		readerStopped = true
+		close(readStop)
+		_ = pc.SetReadDeadline(time.Now())
+		err := <-readDone
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+	snapshotSamples := func() []Sample {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]Sample(nil), samples...)
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var sequence uint32
@@ -104,12 +143,14 @@ loop:
 	for {
 		select {
 		case <-ctx.Done():
-			return Summary{}, samples, ctx.Err()
+			_ = stopReader()
+			return Summary{}, snapshotSamples(), ctx.Err()
 		case <-deadline.C:
 			break loop
 		case <-ticker.C:
 			if err := send(); err != nil {
-				return Summary{}, samples, err
+				_ = stopReader()
+				return Summary{}, snapshotSamples(), err
 			}
 		}
 	}
@@ -118,17 +159,14 @@ loop:
 		grace = 2 * time.Second
 	}
 	time.Sleep(grace)
-	_ = pc.SetReadDeadline(time.Now())
-	select {
-	case err := <-readDone:
-		if err != nil && err != context.Canceled {
-			return Summary{}, samples, err
-		}
-	default:
+	if err := stopReader(); err != nil {
+		return Summary{}, snapshotSamples(), err
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	return summarizeGame(started, sequence, received, samples, interval), append([]Sample(nil), samples...), nil
+	summary := summarizeGame(started, sequence, received, samples, interval)
+	finalSamples := append([]Sample(nil), samples...)
+	mu.Unlock()
+	return summary, finalSamples, nil
 }
 
 func summarizeGame(started time.Time, sent uint32, received map[uint32]bool, samples []Sample, interval time.Duration) Summary {
@@ -165,7 +203,7 @@ func summarizeGame(started time.Time, sent uint32, received map[uint32]bool, sam
 	return Summary{Sent: sentCount, Received: receivedCount, Succeeded: receivedCount, Failed: loss, SuccessPercent: percent(receivedCount, sentCount), LossPercent: percent(loss, sentCount), RTTP50Ms: percentile(latencies, .5), RTTP95Ms: percentile(latencies, .95), RTTP99Ms: percentile(latencies, .99), JitterP95Ms: percentile(jitter, .95), MaxLossBurst: maxBurst, MaxOutageMs: float64(maxBurst) * float64(interval.Microseconds()) / 1000, DurationMs: float64(time.Since(started).Microseconds()) / 1000}
 }
 
-func runWeb(ctx context.Context, dialer C.Dialer, request StartRequest) (Summary, []Sample, error) {
+func runWeb(ctx context.Context, dialer C.Dialer, request StartRequest, emit sampleEmitter) (Summary, []Sample, error) {
 	started := time.Now()
 	duration := time.Duration(request.DurationMs) * time.Millisecond
 	interval := time.Duration(request.IntervalMs) * time.Millisecond
@@ -194,7 +232,7 @@ func runWeb(ctx context.Context, dialer C.Dialer, request StartRequest) (Summary
 		} else {
 			sample.Error = err.Error()
 		}
-		samples = append(samples, sample)
+		emitSample(&samples, sample, emit)
 		seq++
 		select {
 		case <-ctx.Done():
@@ -205,7 +243,7 @@ func runWeb(ctx context.Context, dialer C.Dialer, request StartRequest) (Summary
 	return summarizeRequests(started, samples), samples, nil
 }
 
-func runVideo(ctx context.Context, dialer C.Dialer, request StartRequest) (Summary, []Sample, error) {
+func runVideo(ctx context.Context, dialer C.Dialer, request StartRequest, emit sampleEmitter) (Summary, []Sample, error) {
 	started := time.Now()
 	transport := &http.Transport{DialContext: dialer.DialContext, DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()
@@ -240,7 +278,7 @@ func runVideo(ctx context.Context, dialer C.Dialer, request StartRequest) (Summa
 		if n > 0 {
 			total += int64(n)
 			sample := Sample{Sequence: seq, AtMs: float64(now.Sub(started).Microseconds()) / 1000, Success: true, Bytes: int64(n), GapMs: gap}
-			samples = append(samples, sample)
+			emitSample(&samples, sample, emit)
 			seq++
 			if gap > 500 {
 				stallCount++
