@@ -11,11 +11,16 @@ import (
 	"fmt"
 	"hash"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 const (
 	KeyMethod2 = 2
+
+	// defaultIVProto is the IV_PROTO capability mask advertised when the
+	// configuration does not override it: DATA_V2 | REQUEST_PUSH | AUTH_PENDING.
+	defaultIVProto = (1 << 1) | (1 << 2) | (1 << 4) // 22
 
 	keySourcePreMasterSize = 48
 	keySourceRandomSize    = 32
@@ -304,12 +309,59 @@ func compressionPeerInfo(mode compressionMode) string {
 	}
 }
 
+// peerInfoKeyOrder is the order in which the reference client (ssl.c
+// push_peer_info, 2.4 layout) emits the well-known IV_* entries. Some
+// servers fingerprint the client by this layout, so known keys are always
+// written in this order regardless of where they come from; keys not listed
+// here (UV_*, vendor extensions) follow, sorted by name.
+var peerInfoKeyOrder = []string{
+	"IV_VER",
+	"IV_PLAT",
+	"IV_PROTO",
+	"IV_NCP",
+	"IV_TCPNL",
+	"IV_LZO_STUB",
+	"IV_LZO",
+	"IV_COMP_STUB",
+	"IV_COMP_STUBv2",
+	"IV_CIPHERS",
+	"IV_GUI_VER",
+	"IV_SSL",
+	"IV_PLAT_VER",
+	"IV_HWADDR",
+}
+
 func installScriptPeerInfo(cipher string, dataCiphers []string, mode compressionMode, peerInfo map[string]string) string {
-	ivVer := "mihomo-openvpn"
-	if value, ok := peerInfo["IV_VER"]; ok {
-		ivVer = value
+	entries := make(map[string]string, len(peerInfo)+4)
+	// User-defined entries first; generated fields below take precedence
+	// where the client's behaviour depends on them.
+	for key, value := range peerInfo {
+		entries[key] = value
 	}
-	lzo := compressionPeerInfo(mode)
+	if _, ok := entries["IV_VER"]; !ok {
+		entries["IV_VER"] = "mihomo-openvpn"
+	}
+	// IV_PROTO advertises DATA_V2 (bit 1), REQUEST_PUSH (bit 2) and
+	// AUTH_PENDING keyword support (bit 4). The parser supports
+	// AUTH_PENDING,timeout N, so capability and behavior must agree.
+	// A user-supplied IV_PROTO replaces the advertised value: some servers
+	// gate admission on the capability bits a reference client of a given
+	// generation sends, and under-advertising only disables optional
+	// server-initiated features (AUTH_PENDING, proactive push).
+	ivProto := defaultIVProto
+	if value, ok := entries["IV_PROTO"]; ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && parsed >= 0 {
+			ivProto = parsed
+		}
+	}
+	entries["IV_PROTO"] = strconv.Itoa(ivProto)
+	// Compression capability flags follow the configured framing mode; a
+	// user may only add flags the mode does not already imply.
+	for _, line := range strings.Split(strings.TrimSuffix(compressionPeerInfo(mode), "\n"), "\n") {
+		if key, value, ok := strings.Cut(line, "="); ok {
+			entries[key] = value
+		}
+	}
 	// Build the IV_CIPHERS string. If a data-ciphers list is configured,
 	// send all entries colon-separated. Otherwise, send just the single cipher.
 	ivCiphers := cipher
@@ -320,30 +372,27 @@ func installScriptPeerInfo(cipher string, dataCiphers []string, mode compression
 		}
 		ivCiphers = strings.Join(normalized, ":")
 	}
-	// IV_PROTO advertises DATA_V2 (bit 1), REQUEST_PUSH (bit 2) and
-	// AUTH_PENDING keyword support (bit 4). The parser supports
-	// AUTH_PENDING,timeout N, so capability and behavior must agree.
-	const ivProto = (1 << 1) | (1 << 2) | (1 << 4) // 22
-	info := fmt.Sprintf("IV_VER=%s\nIV_PROTO=%d\n%sIV_CIPHERS=%s\n", ivVer, ivProto, lzo, ivCiphers)
-	// Append user-defined peer-info entries (e.g. IV_HWADDR, UV_*) after the
-	// built-in fields. Keys are sorted so the output is deterministic.
-	keys := make([]string, 0, len(peerInfo))
-	for key := range peerInfo {
-		switch key {
-		case "IV_VER", "IV_PROTO", "IV_CIPHERS":
-			continue
-		case "IV_LZO", "IV_LZO_STUB", "IV_COMP_STUB", "IV_COMP_STUBv2":
-			if strings.Contains(lzo, key+"=") {
-				continue
-			}
+	entries["IV_CIPHERS"] = ivCiphers
+
+	var info strings.Builder
+	written := make(map[string]bool, len(entries))
+	for _, key := range peerInfoKeyOrder {
+		if value, ok := entries[key]; ok {
+			fmt.Fprintf(&info, "%s=%s\n", key, value)
+			written[key] = true
 		}
-		keys = append(keys, key)
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		info += fmt.Sprintf("%s=%s\n", key, peerInfo[key])
+	rest := make([]string, 0, len(entries))
+	for key := range entries {
+		if !written[key] {
+			rest = append(rest, key)
+		}
 	}
-	return info
+	sort.Strings(rest)
+	for _, key := range rest {
+		fmt.Fprintf(&info, "%s=%s\n", key, entries[key])
+	}
+	return info.String()
 }
 
 func appendOpenVPNString(out []byte, s string) []byte {

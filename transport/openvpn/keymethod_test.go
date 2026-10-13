@@ -109,17 +109,49 @@ func TestInstallScriptPeerInfo(t *testing.T) {
 		t.Fatalf("unexpected peer-info:\n got %q\nwant %q", info, want)
 	}
 
-	// A user-defined IV_VER replaces the built-in value, while other generated
-	// fields are not duplicated by peer-info entries.
+	// A user-defined IV_VER or IV_PROTO replaces the built-in value, while
+	// the compression flags and IV_CIPHERS always reflect the client's real
+	// configuration and are not duplicated by peer-info entries.
 	overridden := InstallScriptPeerInfo(CipherAES128GCM, nil, CompLzoYes, map[string]string{
 		"IV_VER":     "custom-client/1.0",
-		"IV_PROTO":   "999",
+		"IV_PROTO":   "2",
 		"IV_LZO":     "0",
 		"IV_CIPHERS": "AES-256-CBC",
 	})
-	want = "IV_VER=custom-client/1.0\nIV_PROTO=22\nIV_LZO=1\nIV_CIPHERS=AES-128-GCM\n"
+	want = "IV_VER=custom-client/1.0\nIV_PROTO=2\nIV_LZO=1\nIV_CIPHERS=AES-128-GCM\n"
 	if overridden != want {
 		t.Fatalf("unexpected overridden peer-info:\n got %q\nwant %q", overridden, want)
+	}
+
+	// An unparsable IV_PROTO falls back to the built-in capability mask.
+	fallback := InstallScriptPeerInfo(CipherAES128GCM, nil, "", map[string]string{"IV_PROTO": "lots"})
+	if fallback != base {
+		t.Fatalf("unexpected peer-info with invalid IV_PROTO:\n got %q\nwant %q", fallback, base)
+	}
+}
+
+func TestInstallScriptPeerInfoReferenceClientOrder(t *testing.T) {
+	// Well-known IV_* keys are emitted in the reference client's layout no
+	// matter how the configuration map iterates; other keys follow sorted.
+	info := InstallScriptPeerInfo(CipherAES256CBC, []string{CipherAES256CBC, CipherAES128GCM}, "", map[string]string{
+		"UV_DEVICE_ID":   "laptop-001",
+		"IV_HWADDR":      "52:54:00:ff:72:87",
+		"IV_TCPNL":       "1",
+		"IV_PLAT":        "mac",
+		"IV_NCP":         "2",
+		"IV_COMP_STUB":   "1",
+		"IV_COMP_STUBv2": "1",
+		"IV_LZO":         "1",
+		"IV_PROTO":       "2",
+		"IV_VER":         "3.8.4",
+		"IV_GUI_VER":     "net.tunnelblick.tunnelblick 6190",
+		"UV_ASSET":       "x",
+	})
+	want := "IV_VER=3.8.4\nIV_PLAT=mac\nIV_PROTO=2\nIV_NCP=2\nIV_TCPNL=1\nIV_LZO=1\nIV_COMP_STUB=1\nIV_COMP_STUBv2=1\n" +
+		"IV_CIPHERS=AES-256-CBC:AES-128-GCM\nIV_GUI_VER=net.tunnelblick.tunnelblick 6190\nIV_HWADDR=52:54:00:ff:72:87\n" +
+		"UV_ASSET=x\nUV_DEVICE_ID=laptop-001\n"
+	if info != want {
+		t.Fatalf("unexpected peer-info order:\n got %q\nwant %q", info, want)
 	}
 }
 

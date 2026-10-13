@@ -308,9 +308,11 @@ func (c *Client) doKeyExchange(ctx context.Context) (*PushReply, error) {
 	}
 
 	c.optionsString = installScriptOptions(c.config.Proto, primaryCipher, c.config.Auth, c.config.compressMode)
+	peerInfo := installScriptPeerInfo(primaryCipher, c.config.DataCiphers, c.config.compressMode, c.config.PeerInfo)
+	log.Debugln("[OpenVPN] client peer-info: %q", peerInfo)
 	clientRecord, err := NewClientKeyMethod2Record(
 		c.optionsString,
-		installScriptPeerInfo(primaryCipher, c.config.DataCiphers, c.config.compressMode, c.config.PeerInfo),
+		peerInfo,
 		c.authUser,
 		c.authPass,
 	)

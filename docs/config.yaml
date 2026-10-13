@@ -1487,7 +1487,16 @@ proxies: # socks5
     #   -----END OpenVPN tls-crypt-v2 client key-----
     # verify-x509-name: "server.example.com" # 可选：校验服务端证书名（对应 .ovpn 的 verify-x509-name）；不配置时仅校验证书链 + ServerAuth EKU，与 OpenVPN 默认一致
     # verify-x509-name-type: name # name（默认，CN 精确匹配）/ name-prefix（CN 前缀）/ subject（完整 subject，格式如 "C=KG, ST=NA, O=Org, CN=Server-1"）
-    # peer-info: # 透传给服务端的 peer-info 键值对，追加在内置 IV_VER/IV_PROTO/IV_CIPHERS 之后；用于服务端基于 peer-info 做准入决策
+    # peer-info: # 透传给服务端的 peer-info 键值对；用于服务端基于 peer-info 做准入决策
+    #   # 已知的 IV_* 键无论在此处的书写顺序如何，都按官方客户端的固定顺序发送
+    #   # （IV_VER, IV_PLAT, IV_PROTO, IV_NCP, IV_TCPNL, 压缩标志, IV_CIPHERS, IV_GUI_VER, IV_SSL, IV_PLAT_VER, IV_HWADDR），其余键按名称排序追加。
+    #   # IV_VER 与 IV_PROTO 可覆盖内置值（默认 mihomo-openvpn / 22）；IV_CIPHERS 与压缩标志始终由实际配置决定，此处的同名项被忽略。
+    #   # 部分服务端只放行官方客户端的指纹，此时可仿照 OpenVPN 2.4 客户端填写：
+    #   # IV_VER: "3.8.4"
+    #   # IV_PLAT: "mac"
+    #   # IV_PROTO: "2"
+    #   # IV_NCP: "2"
+    #   # IV_TCPNL: "1"
     #   IV_HWADDR: "52:54:00:ff:72:87"
     #   UV_DEVICE_ID: "laptop-001"
     # ping: 10 # 保活间隔（秒）；服务端 push 的 ping 会覆盖此值，未配置且服务端未 push 时不发保活，默认值为 0
